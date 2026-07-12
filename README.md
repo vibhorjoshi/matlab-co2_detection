@@ -27,8 +27,7 @@
 8. [Repository Structure — Every File Explained](#8-repository-structure--every-file-explained)
 9. [Installation and Quick Start](#9-installation-and-quick-start)
 10. [Running the Pipeline](#10-running-the-pipeline)
-11. [Files to Remove / Not Needed](#11-files-to-remove--not-needed)
-12. [Citation and License](#12-citation-and-license)
+11. [Citation and License](#12-citation-and-license)
 
 ---
 
