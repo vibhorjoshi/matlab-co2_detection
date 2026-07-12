@@ -128,7 +128,7 @@ While visualizations provide intuitive proof, the **Signal-to-Background Ratio (
 To fulfill the requirements of practical environmental monitoring, the localized anomalies must be anchored to geographic coordinates to trace emissions back to their terrestrial sources. 
 
 <p align="center">
-  <img src="./updated_output_file/Figure4_Geospatial_Validation.jpg" width="850" alt="Geospatial Validation">
+  <img src="./updated_output_file/Figure4_Geospatial_Validation.png" width="850" alt="Geospatial Validation">
 </p>
 <p align="center">
   <em><b>Figure 4.</b> Geographic projection of the thresholded CO₂ hotspot mask. Using the AVIRIS metadata (UTM Zone 11N, WGS-84 datum), the pixel coordinates were mathematically transformed into Latitude and Longitude using the MATLAB Mapping Toolbox. This allows the highly isolated anomaly mask to be overlaid onto a real-world high-resolution satellite basemap for facility identification.</em>
