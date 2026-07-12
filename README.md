@@ -146,35 +146,13 @@ This project strictly adheres to MathWorks Challenge guidelines by fully leverag
 * **Mapping Toolbox:** Geographic coordinate transformations (`projinv`) and spatial referencing (`maprasterref`, `geoaxes`, `geoscatter`).
 
 ---
+## 5. Dataset Acquisition & Extraction (Step-by-Step)
 
-## 5. Data Acquisition & Setup
+Because hyperspectral data cubes are incredibly dense (often exceeding 40 GB per flightline), hosting the raw data directly on GitHub is impossible due to strict file size limits. To ensure a frictionless evaluation process for judges and researchers, we have provided two streamlined pathways to acquire the data.
 
-### Addressing File Size Constraints
-Due to GitHub's strict file size limits (and the impracticality of cloning 41 GB repositories), the raw AVIRIS data file (`f250923t01p00r13_rfl.dat`) is not hosted in this repository. 
+### Option A: Quick Start Setup (Recommended)
+This is the fastest method to run the project. We have provided a pre-cropped, memory-safe Region of Interest (ROI) containing the CO₂ plume in `.mat` format.
 
-To allow reviewers, judges, and researchers to execute the code immediately out-of-the-box, a pre-cropped, memory-safe Region of Interest (ROI) is provided.
-
-### Local Setup Instructions
-1. **Clone this repository** to your local machine using `git clone`.
-2. Ensure the sample dataset **`proposed_results.mat`** is located in the root directory alongside the `.m` scripts.
-3. The codebase utilizes dynamic relative pathing (`pwd`), meaning **no manual directory or path configuration is required.**
-
----
-
-## 6. Repository Structure & Usage
-
-This project has been heavily refactored to prioritize clean architecture and reproducibility. Fragmented stage files and dummy data have been removed. The entire framework operates via two self-contained master scripts.
-
-### Directory Layout
-```text
-.
-├── generate_all_figures.m       # Master script: Runs entire detection & mapping pipeline
-├── histogram_comparison.m       # Statistical validation script: Calculates score distributions
-├── proposed_results.mat         # Sample hyperspectral datacube (Required for execution)
-├── updated_output_file/         # Auto-generated directory containing all results
-│   ├── Figure1_Stagewise_Ablation_3.png
-│   ├── Figure2_Profile_Analysis_3.png
-│   ├── Figure3_Threshold_Sensitivity_3.png
-│   ├── Figure4_Geospatial_Validation_3.jpg
-│   └── Table1_Selectivity_Metrics_3.csv
-└── README.md                    # Project documentation (this file)
+1. **Download the Repository:** Click the green **`<> Code`** button at the top of this repository and select **Download ZIP**, or clone it via your terminal:
+   ```bash
+   git clone [https://github.com/vibhorjoshi/matlab-co2_detection.git](https://github.com/vibhorjoshi/matlab-co2_detection.git)
