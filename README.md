@@ -10,7 +10,7 @@
 
 > **MathWorks MATLAB & Simulink Challenge — Project #251**  
 > *Detection and Visualization of CO₂ Concentration Using Hyperspectral Satellite Data*  
-> Authors: Vibhor Joshi · Namratha Y. · IIIT Guwahati  
+> Authors: Vibhor Joshi · kaveri roy. · dheeraj kumar sharma -IIIT Guwahati  
 > 🔗 [MathWorks Challenge Page](https://github.com/mathworks/MATLAB-Simulink-Challenge-Project-Hub/blob/main/projects/Detection%20and%20Visualization%20of%20CO2%20Concentration%20Using%20Hyperspectral%20Satellite%20Data/README.md)
 
 ---
