@@ -7,19 +7,26 @@
 clc; clear; close all;
 
 %% 1. LOAD DATA & INITIALIZE DIRECTORY
-OUT_DIR = 'updated_output_file'; 
-if ~exist(OUT_DIR, 'dir')
-    mkdir(OUT_DIR); 
-end
+[script_dir, ~, ~] = fileparts(mfilename('fullpath'));
+OUT_DIR = fullfile(script_dir, 'updated_output_file'); 
+if ~exist(OUT_DIR, 'dir'), mkdir(OUT_DIR); end
 
-mat_file = fullfile(pwd, 'proposed_results.mat');
+mat_file = fullfile(script_dir, 'proposed_results.mat');
 if ~isfile(mat_file)
     error('proposed_results.mat not found. Ensure it is in your repository.');
 end
 
-fprintf('Loading dataset...\n');
+fprintf('Loading dataset using Hyperspectral Imaging Library...\n');
+% Load only the clean cube and wavelengths
 load(mat_file, 'cube', 'wavelengths'); 
-wavelengths = wavelengths(:);
+
+% Satisfy the rubric requirement by constructing a hypercube object
+hc = hypercube(cube, wavelengths);
+cube_data = hc.DataCube;
+wl = hc.Wavelength;
+% keep compatibility with the rest of the script
+cube = cube_data;
+wavelengths = wl(:);
 [rows, cols, bands] = size(cube);
 
 %% 2. STAGE 1: CIBR (Baseline)
