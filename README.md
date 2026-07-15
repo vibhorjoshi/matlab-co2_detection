@@ -1,10 +1,10 @@
- # Hyperspectral CO₂ Detection — Stagewise Pipeline with CT-ACE
+# Hyperspectral CO₂ Detection — Stagewise Pipeline with CT-ACE
 
 ![MATLAB](https://img.shields.io/badge/MATLAB-R2021a%2B-orange?style=for-the-badge&logo=mathworks)
 ![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
 ![Data](https://img.shields.io/badge/Data-AVIRIS--NG-green?style=for-the-badge)
 
-A MATLAB framework for detecting atmospheric CO₂ plumes from hyperspectral imagery. The pipeline runs four detection stages in sequence — CIBR → JRGE → SFA → CT-ACE — and the final proposed method, **CT-ACE (Cluster-Tuned Adaptive Coherence Estimator)**, applies an absorbance-domain transformation with K=4 spectral clusters and per-cluster ACE scoring to suppress background clutter and isolate CO₂ plumes.
+A MATLAB framework for detecting atmospheric CO₂ plumes from hyperspectral imagery. The pipeline runs four detection stages in sequence — CIBR → JRGE → SFA → CT-ACE — and the final propose[...]
 
 ---
 
@@ -46,7 +46,7 @@ cube         % [rows × cols × bands] — hyperspectral radiance/reflectance cu
 wavelengths  % [bands × 1]           — band center wavelengths in nanometers
 ```
 
-This project uses **AVIRIS-NG** data. The geospatial overlay in Figure 4 uses **UTM Zone 11N** coordinates (`UL_Easting = 577561.59`, `UL_Northing = 4228899.2`, pixel spacing `dx = dy = 14.4 m`), which places the scene in the western United States.
+This project uses **AVIRIS-NG** data. The geospatial overlay in Figure 4 uses **UTM Zone 11N** coordinates (`UL_Easting = 577561.59`, `UL_Northing = 4228899.2`, pixel spacing `dx = dy = 14.4 m`), whic[...]
 
 ### Downloading AVIRIS-NG Data
 
@@ -68,9 +68,40 @@ save('proposed_results.mat', 'cube', 'wavelengths');
 
 ---
 
+## Data Preprocessing Technique Status
+
+### Atmospheric Correction Rationale
+
+The AVIRIS-NG dataset used in this project is provided as an **L2 (Surface Reflectance) product**, pre-processed by JPL's **ATREM (Atmospheric REMoval)** atmospheric correction algorithms prior to distribution. 
+
+**Intentional Bypass of Secondary Atmospheric Correction:**
+
+Applying a secondary atmospheric correction algorithm (e.g., FLAASH, QUAC) to L2 reflectance data would be **physically incorrect and counterproductive** for CO₂ detection. The reasons are:
+
+1. **Data Integrity:** L2 reflectance has already been corrected by ATREM to remove atmospheric water vapour, aerosol scattering, and Rayleigh effects. Re-applying corrections would introduce artificial artifacts and noise.
+
+2. **Physical Absorption Preservation:** The CO₂ absorption features at 1575 nm and 2005 nm depend on accurate absolute reflectance values. Secondary atmospheric correction would corrupt these subtle spectral features by applying empirically-tuned coefficients that do not account for the specific gas physics.
+
+3. **Linear Relationship in Absorbance Space:** Our methods (particularly CT-ACE) rely on the Beer-Lambert relationship:
+   ```
+   τ (optical depth) = −log(R)
+   ```
+   This relationship is only valid when reflectance `R` is already radiometrically corrected to surface reflectance. Secondary corrections break this linear assumption.
+
+**Spectral Conditioning via Hyperspectral Toolbox:**
+
+While secondary atmospheric correction is bypassed, the pipeline does utilize the MATLAB **Hyperspectral Toolbox** for spectral preprocessing such as:
+- Band selection and water vapour masking (1800–1950 nm)
+- Spectral smoothing and interpolation where needed
+- Dimensionality reduction for clustering operations (K-means)
+
+These conditioning steps are **non-destructive** and preserve the physical meaning of the reflectance data.
+
+---
+
 ## Algorithms
 
-All four algorithms are implemented as standalone functions in `core algorithms/`. Each loads `proposed_results.mat` directly, computes its detection map, and returns a continuous score map and a binary hotspot mask.
+All four algorithms are implemented as standalone functions in `core algorithms/`. Each loads `proposed_results.mat` directly, computes its detection map, and returns a continuous score map and a bina[...]
 
 The hotspot threshold is consistent across all four: **top 5th percentile of scores**, with small connected components under 10 pixels removed (`bwareaopen`).
 
@@ -258,7 +289,7 @@ This shows spatial localization: CT-ACE produces a narrower, higher-contrast pea
 
 Score threshold vs. data percentile (85th to 99th) for CIBR and CT-ACE. Plots `prctile(score, p)` for each method at each percentile `p`.
 
-A method with a steeply rising curve at high percentiles has a **sharp separation** between background and plume — meaning the top-scoring pixels are clearly distinct from the rest. A flat curve means the method cannot distinguish signal from clutter at any threshold. CT-ACE shows a steeper rise, demonstrating stronger plume-to-background contrast.
+A method with a steeply rising curve at high percentiles has a **sharp separation** between background and plume — meaning the top-scoring pixels are clearly distinct from the rest. A flat curve means background and target scores are poorly separated.
 
 ---
 
@@ -280,7 +311,7 @@ Red markers show detected CO₂ hotspot pixels in geographic coordinates. This v
 
 ## Why CT-ACE Outperforms the Other Stages
 
-The `src/histogram_comparison.m` script provides a direct quantitative comparison between the **baseline Global Matched Filter** (applied to raw reflectance with a single global covariance) and the **proposed CT-ACE** (absorbance domain, K=4 clusters).
+The `src/histogram_comparison.m` script provides a direct quantitative comparison between the **baseline Global Matched Filter** (applied to raw reflectance with a single global covariance) and the **CT-ACE method**.
 
 **What the baseline global MF does:**
 - Flattens the entire scene into one covariance matrix
@@ -293,7 +324,7 @@ The `src/histogram_comparison.m` script provides a direct quantitative compariso
 3. The ACE score formula `num² / (den1 × den2)` normalises each pixel's response by its own per-cluster background energy, not the global scene average
 4. Median filtering removes isolated single-pixel noise that passes the score threshold
 
-The `histogram_comparison.m` output (`output_figures/histogram_scores.png`) plots the full score distributions of both methods side by side and prints a statistics table (mean, median, std, max, 95th percentile) to the console.
+The `histogram_comparison.m` output (`output_figures/histogram_scores.png`) plots the full score distributions of both methods side by side and prints a statistics table (mean, median, std, max, 95th percentile) demonstrating CT-ACE's superior separation of target and background.
 
 ---
 
