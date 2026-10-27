@@ -189,6 +189,5 @@ The Hyperspectral Imaging Library is used solely for convenient ENVI loading; a 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
 **Author:** [Vibhor Joshi](https://github.com/vibhorjoshi)
 ```
