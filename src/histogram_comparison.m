@@ -1,46 +1,47 @@
-function [kl_divergence, metrics] = histogramcomparison(background_cube, plume_detected_cube, bin_edges)
-% HISTOGRAMCOMPARISON Evaluates radiometric distribution divergence between 
-% background clutter and detected CO2 plume regions.
+function [kl_div, metrics] = histogram_comparison(baseline_map, proposed_map, outDir)
+%HISTOGRAM_COMPARISON  Score-distribution comparison (Baseline vs CT-ACE)
 %
-% Inputs:
-%   background_cube     - 3D numeric array of pure background radiance
-%   plume_detected_cube - 3D numeric array of isolated plume radiance pixels
-%   bin_edges           - Vector of histogram bin boundaries
+%   [kl_div, metrics] = histogram_comparison(baseline_map, proposed_map)
+%   [kl_div, metrics] = histogram_comparison(baseline_map, proposed_map, outDir)
 %
-% Outputs:
-%   kl_divergence       - Scalar Kullback-Leibler divergence score
-%   metrics             - Struct containing overlap coefficients and means
+% Computes KL divergence and overlap between the two detection-score maps.
+% When outDir is supplied the figure is also saved there.
 
     if nargin < 3
-        bin_edges = linspace(0, 1, 50);
+        outDir = [];
     end
-    
-    bg_flat = background_cube(:);
-    pl_flat = plume_detected_cube(:);
-    
-    % Compute normalized probability histograms
-    p_bg = histcounts(bg_flat, bin_edges, 'Normalization', 'probability');
-    p_pl = histcounts(pl_flat, bin_edges, 'Normalization', 'probability');
-    
-    % Smooth to prevent zero-division in KL divergence
+
+    b = baseline_map(:);
+    p = proposed_map(:);
+    b = b(isfinite(b));
+    p = p(isfinite(p));
+
+    bin_edges = linspace(0, 1, 51);
+    pb = histcounts(b, bin_edges, 'Normalization', 'probability');
+    pp = histcounts(p, bin_edges, 'Normalization', 'probability');
+
     eps_val = 1e-10;
-    p_bg = p_bg + eps_val; p_bg = p_bg / sum(p_bg);
-    p_pl = p_pl + eps_val; p_pl = p_pl / sum(p_pl);
-    
-    % Compute Kullback-Leibler Divergence (D_KL(Plume || Background))
-    kl_divergence = sum(p_pl .* log(p_pl ./ p_bg));
-    
-    % Additional statistical separation metrics
-    metrics.overlap_coefficient = sum(min([p_bg; p_pl], [], 1));
-    metrics.background_mean = mean(bg_flat);
-    metrics.plume_mean = mean(pl_flat);
-    
-    % Visualization block for baseline reporting
-    figure('Name', 'Histogram Baseline Comparison', 'Color', 'w');
-    bar(bin_edges(1:end-1), [p_bg', p_pl'], 'grouped');
-    xlabel('Radiance Intensity / Spectral Score');
-    ylabel('Normalized Probability Density');
-    legend({'Background Clutter', 'Detected Plume Region'});
-    title(sprintf('Baseline Distribution Analysis (KL Divergence: %.4f)', kl_divergence));
-    grid on;
+    pb = pb + eps_val; pb = pb / sum(pb);
+    pp = pp + eps_val; pp = pp / sum(pp);
+
+    kl_div = sum(pp .* log(pp ./ pb));          % D_KL(proposed || baseline)
+
+    metrics.overlap_coefficient = sum(min(pb, pp));
+    metrics.baseline_mean  = mean(b);
+    metrics.proposed_mean  = mean(p);
+    metrics.baseline_std   = std(b);
+    metrics.proposed_std   = std(p);
+
+    % Visualisation
+    fig = figure('Name','Histogram Comparison – Baseline vs CT-ACE','Color','w');
+    bar(bin_edges(1:end-1), [pb; pp]', 'grouped');
+    xlabel('Normalized detection score');
+    ylabel('Probability density');
+    legend({'Baseline (CIBR)','Proposed (CT-ACE)'}, 'Location','best');
+    title(sprintf('Score distribution comparison  (KL = %.4f)', kl_div));
+    grid on; box on;
+
+    if ~isempty(outDir) && exist(outDir, 'dir')
+        print(fig, fullfile(outDir, 'histogram_scores.png'), '-dpng', '-r150');
+    end
 end
