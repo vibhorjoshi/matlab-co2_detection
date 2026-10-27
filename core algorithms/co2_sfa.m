@@ -1,49 +1,50 @@
-function [sfa_map, plume_mask] = co2sfa(radiance_cube, threshold)
-% CO2SFA Applies Slow Feature Analysis to isolate invariant/slowly varying components.
+function [co2_map, binary_map] = co2_sfa(cube, wavelengths)
+%CO2_SFA  Spectral Fitting Algorithm – correlation with dual-band CO2 template
 %
-% Inputs:
-%   radiance_cube - 3D numeric array (Height x Width x Bands)
-%   threshold     - Statistical anomaly threshold
+%   [co2_map, binary_map] = co2_sfa(cube, wavelengths)
 %
-% Outputs:
-%   sfa_map       - 2D slow feature projection map
-%   plume_mask    - 2D binary plume mask
+% Template is a dual Gaussian centred at 1575 nm and 2005 nm (L2-normalised).
+% Matching is performed after mean-centring both the observed spectrum and
+% the template so that the continuum shape does not dominate the score.
 
-    [height, width, bands] = size(radiance_cube);
-    X = double(reshape(radiance_cube, height * width, bands));
-    
-    % Zero-mean normalization
-    X_mean = mean(X, 1);
-    X_centered = X - X_mean;
-    
-    % Covariance matrix and whitening
-    C = (X_centered' * X_centered) / (size(X, 1) - 1);
-    [V, D] = eig(C);
-    
-    evals = diag(D);
-    [evals_sorted, sort_idx] = sort(evals, 'descend');
-    V_sorted = V(:, sort_idx);
-    
-    % Whitening matrix
-    W = diag(1 ./ sqrt(evals_sorted + 1e-5)) * V_sorted';
-    X_white = X_centered * W';
-    
-    % Time derivative approximation (spatial finite differences)
-    X_spatial = reshape(X_white, height, width, bands);
-    dX_dx = diff(X_spatial, 1, 2); % horizontal derivative
-    dX_dy = diff(X_spatial, 1, 1); % vertical derivative
-    
-    % SFA optimization via derivative covariance eigen-decomposition
-    dX_flat = [reshape(dX_dx, [], bands); reshape(dX_dy(1:end-1,:,:), [], bands)];
-    Omega = (dX_flat' * dX_flat) / size(dX_flat, 1);
-    
-    [W_sfa, ~] = eig(Omega);
-    sfa_projection = X_white * W_sfa(:, 1); % Slowest feature
-    
-    sfa_map = reshape(sfa_projection, height, width);
-    
-    % Anomaly thresholding based on robust median absolute deviation (MAD)
-    med_val = median(sfa_map(:));
-    mad_val = mad(sfa_map(:), 1);
-    plume_mask = abs(sfa_map - med_val) > (threshold * mad_val);
+    if nargin < 2
+        error('co2_sfa:NotEnoughInputs', 'Provide cube and wavelengths.');
+    end
+
+    wavelengths = wavelengths(:);
+    [H, W, ~] = size(cube);
+
+    band_mask = wavelengths >= 1500 & wavelengths <= 2100;
+    if sum(band_mask) < 10
+        band_mask = true(size(wavelengths));
+    end
+    wl = wavelengths(band_mask);
+    X  = double(cube(:,:,band_mask));
+    nB = numel(wl);
+
+    % Dual-band CO2 absorption template (identical definition used by CT-ACE)
+    amp1 = 0.30; cen1 = 1575; sig1 = 15;
+    amp2 = 0.70; cen2 = 2005; sig2 = 12;
+    sig = amp1 * exp(-0.5*((wl-cen1)/sig1).^2) + ...
+          amp2 * exp(-0.5*((wl-cen2)/sig2).^2);
+    sig  = sig / norm(sig);
+    ref0 = sig - mean(sig);                 % mean-centred
+
+    % Vectorised per-pixel correlation
+    X2d = reshape(X, H*W, nB);
+    mu  = mean(X2d, 2);
+    sd  = std(X2d, 0, 2);
+    sd(sd < 1e-8) = 1;                      % avoid division by zero
+    Xn  = (X2d - mu) ./ sd;
+    scores = (Xn * ref0) / nB;
+    scores = max(scores, 0);
+
+    co2_map = reshape(scores, H, W);
+    mx = max(co2_map(:));
+    if mx > 0
+        co2_map = co2_map / mx;
+    end
+
+    thr = prctile(co2_map(:), 95);
+    binary_map = bwareaopen(co2_map > thr, 10);
 end
