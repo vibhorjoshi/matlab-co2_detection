@@ -1,36 +1,49 @@
-function [cibr_map, plume_mask] = co2cibr(radiance_cube, wavelengths, absorption_band_idx, ref_band_indices, threshold)
-% CO2CIBR Computes the Carbon Dioxide Absorption Band Index Ratio (CIBR).
+function [co2_index, hotspot_mask] = co2_cibr(cube, wavelengths)
+%CO2_CIBR  Continuum Interpolated Band Ratio for CO2 detection (~2005 nm)
 %
-% Inputs:
-%   radiance_cube        - 3D numeric array (Height x Width x Bands)
-%   wavelengths          - 1D vector of spectral band centers
-%   absorption_band_idx  - Index of the primary CO2 absorption feature (e.g., ~2.0 µm region)
-%   ref_band_indices     - 1 or 2 indices representing reference continuum bands
-%   threshold            - Scalar threshold for plume delineation
+%   [co2_index, hotspot_mask] = co2_cibr(cube, wavelengths)
 %
-% Outputs:
-%   cibr_map             - 2D spatial ratio map
-%   plume_mask           - 2D logical mask
+% Inputs
+%   cube         HxWxB hyperspectral cube (reflectance or radiance)
+%   wavelengths  Bx1 band centres in nanometres
+%
+% Outputs
+%   co2_index    HxW normalised score map in [0,1]
+%   hotspot_mask HxW logical mask (95th percentile + bwareaopen)
 
-    validateattributes(radiance_cube, {'numeric'}, {'ndim', 3}, mfilename, 'radiance_cube', 1);
-    [height, width, bands] = size(radiance_cube);
-    
-    pixel_spectra = reshape(radiance_cube, height * width, bands);
-    
-    % Extract absorption and reference radiances
-    r_abs = pixel_spectra(:, absorption_band_idx);
-    
-    if length(ref_band_indices) == 2
-        r_ref = mean(pixel_spectra(:, ref_band_indices), 2);
-    else
-        r_ref = pixel_spectra(:, ref_band_indices);
+    if nargin < 2
+        error('co2_cibr:NotEnoughInputs', 'Provide cube and wavelengths.');
     end
-    
-    % CIBR Formulation: Ratio of absorption band to interpolated continuum reference
-    ratio_vector = r_abs ./ max(r_ref, 1e-4);
-    
-    cibr_map = reshape(ratio_vector, height, width);
-    
-    % Low ratio values indicate enhanced absorption (CO2 presence)
-    plume_mask = cibr_map < threshold;
+
+    wavelengths = wavelengths(:);
+    [H, W, ~] = size(cube);
+
+    % Continuum bands around the strong CO2 feature
+    left_wl  = 1980;
+    abs_wl   = 2005;
+    right_wl = 2030;
+
+    [~, iL] = min(abs(wavelengths - left_wl));
+    [~, iA] = min(abs(wavelengths - abs_wl));
+    [~, iR] = min(abs(wavelengths - right_wl));
+
+    L = double(cube(:,:,iL));
+    A = double(cube(:,:,iA));
+    R = double(cube(:,:,iR));
+
+    continuum = (L + R) / 2;
+    cibr = continuum - A;
+    cibr = max(cibr, 0);                 % rectify negative values
+
+    cibr = medfilt2(cibr, [3 3]);
+
+    mx = max(cibr(:));
+    if mx > 0
+        co2_index = cibr / mx;
+    else
+        co2_index = zeros(H, W);
+    end
+
+    thr = prctile(co2_index(:), 95);
+    hotspot_mask = bwareaopen(co2_index > thr, 10);
 end
