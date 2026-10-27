@@ -1,4 +1,3 @@
-```markdown
 # Hyperspectral CO₂ Detection — Stagewise Pipeline with CT-ACE
 
 ![MATLAB](https://img.shields.io/badge/MATLAB-R2021a%2B-orange?style=for-the-badge&logo=mathworks)
