@@ -1,36 +1,56 @@
-function [jrge_score_map, plume_mask] = co2jrge(radiance_cube, background_subspace, target_vector, threshold)
-% CO2JRGE Computes Joint Residual Gas Enhancement detection scores.
+function [gas_map, binary_hotspots] = co2_jrge(cube, wavelengths)
+%CO2_JRGE  Joint Reflectance and Gas Estimation (iterative continuum residual)
 %
-% Inputs:
-%   radiance_cube       - 3D numeric array (Height x Width x Bands)
-%   background_subspace - Orthonormal basis matrix of background clutter (Bands x SubspaceDim)
-%   target_vector       - Target gas absorption vector (Bands x 1)
-%   threshold           - Detection threshold
+%   [gas_map, binary_hotspots] = co2_jrge(cube, wavelengths)
 %
-% Outputs:
-%   jrge_score_map      - 2D spatial score map
-%   plume_mask          - 2D logical detection mask
+% Operates in the 2000-2100 nm window. Accumulates gas-column estimate
+% over three iterations of continuum residual fitting.
 
-    [height, width, bands] = size(radiance_cube);
-    pixel_spectra = reshape(radiance_cube, height * width, bands);
-    
-    t = target_vector(:);
-    
-    % Project spectra onto background orthogonal complement space
-    P_orth = eye(bands) - (background_subspace * background_subspace');
-    
-    residual_spectra = pixel_spectra * P_orth;
-    projected_target = P_orth * t;
-    
-    norm_proj_target = norm(projected_target);
-    if norm_proj_target > 0
-        unit_target = projected_target / norm_proj_target;
-    else
-        unit_target = projected_target;
+    if nargin < 2
+        error('co2_jrge:NotEnoughInputs', 'Provide cube and wavelengths.');
     end
-    
-    score_vector = residual_spectra * unit_target;
-    jrge_score_map = reshape(score_vector, height, width);
-    
-    plume_mask = jrge_score_map > threshold;
+
+    wavelengths = wavelengths(:);
+    [H, W, ~] = size(cube);
+
+    band_mask = wavelengths >= 2000 & wavelengths <= 2100;
+    if sum(band_mask) < 5
+        band_mask = wavelengths >= 1950 & wavelengths <= 2150;
+    end
+    X = double(cube(:,:,band_mask));
+    nBands = size(X, 3);
+
+    gasCol = zeros(H, W);
+    nIter  = 3;
+    scale  = 0.05;
+
+    for t = 1:nIter
+        % Linear continuum between first and last band of the window
+        C = zeros(H, W, nBands);
+        for b = 1:nBands
+            alpha = (b-1) / max(nBands-1, 1);
+            C(:,:,b) = (1-alpha)*X(:,:,1) + alpha*X(:,:,end);
+        end
+
+        residual = max(C - X, 0);                 % absorption only
+        sumRes   = sum(residual, 3);
+        tau      = scale * sumRes / nBands;
+        gasCol   = gasCol + tau;
+
+        % Remove estimated gas contribution
+        shape = residual ./ max(sumRes, 1e-8);
+        for b = 1:nBands
+            X(:,:,b) = X(:,:,b) + tau .* shape(:,:,b);
+        end
+    end
+
+    mx = max(gasCol(:));
+    if mx > 0
+        gas_map = gasCol / mx;
+    else
+        gas_map = zeros(H, W);
+    end
+
+    thr = prctile(gas_map(:), 95);
+    binary_hotspots = bwareaopen(gas_map > thr, 10);
 end
