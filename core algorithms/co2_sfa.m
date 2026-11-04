@@ -4,17 +4,7 @@ function [co2_map, hotspot_mask, info] = co2_sfa(varargin)
 %
 %   [co2_map, hotspot_mask, info] = co2_sfa(cube, wavelengths)   (same inputs as co2_cibr)
 %
-%   Root-cause fix: matching a narrow absorption template against RAW
-%   reflectance is dominated by the continuum level and slope (hence the old
-%   SBR < 1). Here every absorption window of cfg.features gets a local
-%   straight-line continuum (see CO2_CONTINUUM_TAU), the spectra become
-%   optical depth  tau = -log(R/continuum), and the template is matched to
-%   tau, so the score reflects absorption depth only.
-%
-%   cfg.sfa.score = 'cosine'    cosine similarity (SAM-equivalent, scale-free)
-%                 = 'amplitude' least-squares template amplitude <t,tau>
-%   The SAM/cosine is computed directly; the add-on's spectralMatch is NOT
-%   needed (its API takes a reference-library struct, not a numeric vector).
+
     U = co2_util();
     [D, cfg, ~] = U.prepare(varargin);
     wl = D.wl(:);
