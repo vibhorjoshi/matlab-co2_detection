@@ -3,7 +3,6 @@ function [co2_map, hotspot_mask, info] = co2_sfa(varargin)
 %   [co2_map, hotspot_mask, info] = co2_sfa(cube, wavelengths)   HxWxB reflectance cube, Bx1 band centres (nm)
 %
 %   [co2_map, hotspot_mask, info] = co2_sfa(cube, wavelengths)   (same inputs as co2_cibr)
-%
 
     U = co2_util();
     [D, cfg, ~] = U.prepare(varargin);
