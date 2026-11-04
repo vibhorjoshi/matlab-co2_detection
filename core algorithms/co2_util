@@ -1,1 +1,1211 @@
+function U = co2_util(varargin)
+%CO2_UTIL  Shared helpers for the four detectors, main_pipeline and histogram_comparison.
+%
+%   U = co2_util()            struct of function handles (U.cfg, U.prepare, U.ctAce, ...)
+%   co2_util('selftest')      runs the regression tests (no toolbox beyond the core ones)
+%   co2_util('prepareFallback', 'scene.hdr')   builds a VALID proposed_results.mat
+%
+%   Everything that used to be duplicated between the detectors - constants,
+%   data loading/validation, ENVI header and georeference parsing, the CT-ACE
+%   statistic, shared post-processing, ROC/AUC metrics, the synthetic known-plume
+%   scene, figure/overlay helpers - lives here exactly once.
+    if nargin > 0 && ischar(varargin{1})
+        switch lower(varargin{1})
+            case 'selftest',        co2_selftest();                          U = [];  return
+            case 'preparefallback', U = co2_prepare_fallback(varargin{2:end});  return
+        end
+    end
+    U = struct( ...
+        'root', @co2_root,...
+        'cfg', @co2_config,...
+        'opts', @co2_parse_options,...
+        'bands', @co2_bands,...
+        'floor', @co2_data_floor,...
+        'target', @co2_build_target,...
+        'targetFromT', @co2_target_from_transmittance,...
+        'absorbance', @co2_absorbance,...
+        'contTau', @co2_continuum_tau,...
+        'ctAce', @co2_ct_ace,...
+        'finalize', @co2_finalize,...
+        'threshold', @co2_threshold,...
+        'metrics', @co2_eval_metrics,...
+        'loadCube', @co2_load_cube,...
+        'synth', @co2_synthetic_scene,...
+        'prepare', @co2_prepare,...
+        'resolve', @co2_resolve_data,...
+        'crop', @co2_crop,...
+        'validate', @co2_validate_cube,...
+        'parseHeader', @co2_parse_envi_header,...
+        'georefFromHeader', @co2_georef_from_header,...
+        'pixelToUtm', @co2_pixel_to_utm,...
+        'geoOverlay', @co2_geo_overlay,...
+        'saveFig', @co2_save_figure,...
+        'baselineMF', @co2_baseline_mf,...
+        'hypercube', @co2_make_hypercube);
+end
 
+% =========================================================================
+function [A, info] = co2_absorbance(R, fl)
+%CO2_ABSORBANCE  Natural-log optical depth  A = -log(max(R, fl)).
+%   fl is the data-driven floor (see CO2_DATA_FLOOR). The function reports
+%   how many samples were clamped; more than 1 % means the data are not
+%   valid reflectance and a warning is raised.
+    info.floor       = fl;
+    info.clampedFrac = mean(R(:) < fl);
+    if info.clampedFrac > 0.01
+        warning('co2:absorbanceClamp', ...
+            '%.1f %% of samples were clamped by the absorbance floor (%.3g). Check data units.', ...
+            100 * info.clampedFrac, fl);
+    end
+    A = -log(max(R, fl));
+end
+
+% =========================================================================
+function sel = co2_bands(wl, cfg)
+%CO2_BANDS  Logical mask of the bands used by JRGE / CT-ACE / baseline MF:
+%   SWIR 1500-2100 nm with the 1800-1950 nm water-vapour region removed.
+    wl  = wl(:);
+    sel = wl >= cfg.swir(1) & wl <= cfg.swir(2) & ~(wl >= cfg.water(1) & wl <= cfg.water(2));
+end
+
+% =========================================================================
+function [score, mask, info] = co2_baseline_mf(varargin)
+%CO2_BASELINE_MF  Baseline: standard GLOBAL matched filter on raw reflectance.
+%   One scene-wide mean/covariance, no clustering, no absorbance transform.
+%       mf(x) = t' C^-1 (x - mu) / (t' C^-1 t)
+%   The reflectance-domain target is the NEGATED template: CO2 absorption lowers
+%   reflectance, so a positive template would score plume pixels with the wrong
+%   sign. Same inputs and post-processing as the four stages.
+    [D, cfg, ~] = co2_prepare(varargin);
+    sel = co2_bands(D.wl, cfg);
+    wls = D.wl(sel);  M = numel(wls);
+    [rows, cols, ~] = size(D.cube);  N = rows * cols;
+    X  = reshape(D.cube(:, :, sel), N, M);
+    t  = co2_build_target(wls, cfg);
+    t  = -(t - mean(t));  t = t / norm(t);          % absorption LOWERS reflectance -> negative template
+    C  = cov(X);  C = C + cfg.ctace.ridge * (trace(C) / M) * eye(M);
+    w  = C \ t;
+    raw = (X - mean(X, 1)) * w / (t' * w);
+    [score, mask, fin] = co2_finalize(reshape(raw, rows, cols), D, cfg);
+    info = fin;
+end
+
+% =========================================================================
+function t = co2_build_target(wl, cfg)
+%CO2_BUILD_TARGET  L2-normalised CO2 absorption template (column vector).
+%
+%   The default template is a dual-Gaussian PROXY (1575 nm and 2005 nm
+%   features). It is the same function for SFA, JRGE and CT-ACE.
+%   For a physics-based template use CO2_TARGET_FROM_TRANSMITTANCE.
+    wl = wl(:);
+    t  = zeros(numel(wl), 1);
+    for k = 1:numel(cfg.template.amp)
+        t = t + cfg.template.amp(k) * ...
+            exp(-0.5 * ((wl - cfg.template.center(k)) / cfg.template.sigma(k)).^2);
+    end
+    t = t / (norm(t) + eps);
+end
+
+% =========================================================================
+function cfg = co2_config(overrides)
+%CO2_CONFIG  Single source of truth for every tunable constant.
+%
+%   cfg = co2_config()               defaults
+%   cfg = co2_config(struct('ctace', struct('K', 6)))   override one field
+%
+%   Every detector, the pipeline and the tests read their constants from
+%   here, so there is exactly ONE log base, ONE ridge, ONE seed, ONE
+%   threshold rule and ONE set of band centres in the whole repository.
+
+    % ---- spectral windows (nm) ------------------------------------------
+    cfg.swir      = [1500 2100];          % usable SWIR window
+    cfg.water     = [1800 1950];          % water-vapour region (excluded)
+
+    % ---- Stage 1: CIBR three-band centres (nm) --------------------------
+    cfg.cibr      = struct('left', 1980, 'center', 2005, 'right', 2030);
+
+    % ---- CO2 template used by SFA, JRGE and CT-ACE (dual Gaussian proxy) -
+    cfg.template  = struct('amp',    [0.30 0.70], ...
+                           'center', [1575 2005], ...
+                           'sigma',  [15   12  ]);
+
+    % ---- SFA: absorption-feature windows, shoulder bands per side -------
+    cfg.features  = [1530 1620; 1970 2045];
+    cfg.nShoulder = 2;
+    cfg.sfa       = struct('score', 'cosine');    % 'cosine' | 'amplitude'
+
+    % ---- JRGE: polynomial background in absorbance space -----------------
+    cfg.jrge      = struct('degree', 3, 'iterations', 3, ...
+                           'guard', 35, 'chunk', 50000);
+
+    % ---- CT-ACE ---------------------------------------------------------
+    cfg.ctace     = struct('K', 4, ...
+                           'ridge', 1e-6, ...      % relative to trace(C)/M
+                           'seed', 1, ...
+                           'maxIter', 200, ...
+                           'replicates', 3, ...
+                           'minExtra', 5, ...
+                           'robustIter', 0, ...    % >0: re-estimate cluster stats without top pixels
+                           'robustTrim', 5, ...    % percent of highest-scoring pixels excluded
+                           'absorbance', true, ... % false = reflectance domain
+                           'useToolbox', false);   % opt-in detectTarget path
+
+    % ---- data handling --------------------------------------------------
+    cfg.floorPct  = 0.5;                  % absorbance floor = this percentile
+                                          % of the positive reflectance samples
+    % ---- post-processing (shared by all stages) --------------------------
+    cfg.median    = [3 3];
+    cfg.normalize = [2 99.5];             % display stretch (percentiles)
+    cfg.threshold = struct('rule', 'percentile', ...  % 'percentile'|'madz'|'otsu'
+                           'value', 95, ...
+                           'minArea', 10);
+
+    % ---- fallback geo-reference (used ONLY if neither the ENVI header nor
+    %      the .mat file carries one). Values come from the header of
+    %      flightline f250923t01p00r13.
+    cfg.fallbackGeoref = struct('UL_E', 577561.590, 'UL_N', 4228899.200, ...
+                                'dx', 14.4, 'dy', 14.4, 'zone', 11, ...
+                                'hemisphere', 'North', 'epsg', 32611, ...
+                                'source', 'config fallback (header of f250923t01p00r13)', ...
+                                'isSynthetic', false);
+
+    if nargin > 0 && ~isempty(overrides)
+        cfg = merge_struct(cfg, overrides);
+    end
+end
+
+function a = merge_struct(a, b)
+    f = fieldnames(b);
+    for i = 1:numel(f)
+        if isstruct(b.(f{i})) && isfield(a, f{i}) && isstruct(a.(f{i}))
+            a.(f{i}) = merge_struct(a.(f{i}), b.(f{i}));
+        else
+            a.(f{i}) = b.(f{i});
+        end
+    end
+end
+
+% =========================================================================
+function [tau, idx] = co2_continuum_tau(R2, wl, windows, nShoulder, fl)
+%CO2_CONTINUUM_TAU  Continuum-removed optical depth inside absorption windows.
+%
+%   For each window [lo hi] a straight-line continuum is drawn through the
+%   mean of the first and last nShoulder bands, and
+%       tau = -log( R / continuum ).
+%   tau is ~0 on the shoulders and positive inside an absorption feature, so
+%   it reflects absorption DEPTH rather than the continuum level or slope.
+%   Vectorised over all N pixels (R2 is N x bands).
+    wl = wl(:);  tau = [];  idx = [];
+    for w = 1:size(windows, 1)
+        i = find(wl >= windows(w, 1) & wl <= windows(w, 2));
+        if numel(i) < 2 * nShoulder + 1
+            error('co2:window', 'Window [%g %g] nm holds only %d bands.', windows(w, :), numel(i));
+        end
+        L = i(1:nShoulder);  Rr = i(end-nShoulder+1:end);
+        yl = mean(R2(:, L), 2);   yr = mean(R2(:, Rr), 2);
+        xl = mean(wl(L));         xr = mean(wl(Rr));
+        frac = (wl(i)' - xl) / (xr - xl);                 % 1 x m
+        C    = yl + (yr - yl) .* frac;                    % N x m
+        tau  = [tau, -log(max(R2(:, i), fl) ./ max(C, fl))]; %#ok<AGROW>
+        idx  = [idx; i(:)];                               %#ok<AGROW>
+    end
+end
+
+% =========================================================================
+function D = co2_crop(D, crop)
+%CO2_CROP  Crop a data struct to [r1 r2 c1 c2] with a bounds check.
+%   crop = [] or 'full' returns D unchanged. Out-of-range limits are clipped
+%   with a warning; an empty result is an error. The geo-reference origin
+%   moves with the crop.
+    if isempty(crop) || (ischar(crop) && strcmpi(crop, 'full')), return, end
+    if ~isnumeric(crop) || numel(crop) ~= 4
+        error('co2:crop', 'Crop must be [] / ''full'' / [rowStart rowEnd colStart colEnd].');
+    end
+    [rows, cols, ~] = size(D.cube);
+    r1 = max(1, crop(1));  r2 = min(rows, crop(2));
+    c1 = max(1, crop(3));  c2 = min(cols, crop(4));
+    if r1 ~= crop(1) || r2 ~= crop(2) || c1 ~= crop(3) || c2 ~= crop(4)
+        warning('co2:cropClipped', 'Crop [%d %d %d %d] clipped to image size %dx%d -> [%d %d %d %d].', ...
+                crop, rows, cols, r1, r2, c1, c2);
+    end
+    if r1 > r2 || c1 > c2
+        error('co2:crop', 'Crop window is empty for an image of %d x %d pixels.', rows, cols);
+    end
+    D.cube    = D.cube(r1:r2, c1:c2, :);
+    D.invalid = D.invalid(r1:r2, c1:c2);
+    if isfield(D, 'truth') && ~isempty(D.truth), D.truth = D.truth(r1:r2, c1:c2); end
+    if isfield(D, 'georef') && ~isempty(D.georef)
+        D.georef.UL_E = D.georef.UL_E + (c1 - 1) * D.georef.dx;
+        D.georef.UL_N = D.georef.UL_N - (r1 - 1) * D.georef.dy;
+    end
+    D.cropWindow = [r1 r2 c1 c2];
+end
+
+% =========================================================================
+function [score, cluster, info] = co2_ct_ace(X, t, wl, cfg)
+%CO2_CT_ACE  The ONE implementation of the Cluster-Tuned ACE (CT-ACE).
+%
+%   X   [N x M]  pixel spectra (absorbance for CT-ACE; reflectance for ablations)
+%   t   [M x 1]  target signature
+%   wl  [M x 1]  band centres (only used by the optional toolbox path)
+%
+%   1. K-means (K = cfg.ctace.K, fixed seed) groups pixels with similar spectra.
+%   2. Inside each cluster the background mean/covariance are estimated
+%      separately (relative ridge, backslash instead of inv()).
+%   3. Every pixel gets the SIGNED squared-cosine ACE statistic
+%          sign(m) * m^2 / ( (x'C^-1 x) (t'C^-1 t) ),   m = t'C^-1 x,  x = pixel - mean
+%      Clusters too small for a stable covariance borrow the global statistics
+%      (they are scored, not dropped).
+%   With cfg.ctace.useToolbox = true and the Hyperspectral add-on present, the
+%   per-cluster statistic is delegated to detectTarget(hcube, t, "SignedACE");
+%   any failure falls back to the closed form with a warning.
+    c = cfg.ctace;
+    [N, M] = size(X);
+    t = t(:);
+
+    rng(c.seed);                                          % reproducible clustering
+    if c.K > 1
+        cluster = kmeans(X, c.K, 'MaxIter', c.maxIter, 'Distance', 'sqeuclidean', ...
+                         'Replicates', c.replicates);
+    else
+        cluster = ones(N, 1);
+    end
+
+    score = zeros(N, 1);
+    info.sizes = zeros(1, max(c.K, 1));  info.borrowedGlobal = false(1, max(c.K, 1));
+    gMu = []; gC = [];
+    for k = 1:max(c.K, 1)
+        idx = (cluster == k);  nk = nnz(idx);  info.sizes(k) = nk;
+        if nk == 0, continue, end
+        if nk < M + c.minExtra                              % too few pixels: global stats
+            if isempty(gMu), gMu = mean(X, 1); gC = cov(X); end
+            mu = gMu;  C = gC;  info.borrowedGlobal(k) = true;
+            fitIdx = [];
+        else
+            mu = mean(X(idx, :), 1);  C = cov(X(idx, :));
+            fitIdx = find(idx);
+        end
+
+        s = [];
+        if c.useToolbox && exist('detectTarget', 'file') ~= 0
+            s = toolbox_ace(X(idx, :), t, wl);
+        end
+        if isempty(s)
+            s = ace_closed_form(X(idx, :), t, mu, C, c.ridge);
+            % Optional plume-robust refit: a plume that fills part of a cluster
+            % inflates the background covariance along the target direction and
+            % suppresses its own score. Re-estimate mu/C WITHOUT the top pixels.
+            for it = 1:c.robustIter
+                if isempty(fitIdx), break, end
+                keep = s <= prctile(s, 100 - c.robustTrim);
+                if nnz(keep) < M + c.minExtra, break, end
+                Xk = X(fitIdx(keep), :);
+                s  = ace_closed_form(X(idx, :), t, mean(Xk, 1), cov(Xk), c.ridge);
+            end
+        end
+        score(idx) = s;
+    end
+end
+
+function s = ace_closed_form(Xk, t, mu, C, ridge)
+%ACE_CLOSED_FORM  Signed squared-cosine ACE for the rows of Xk.
+    M  = size(Xk, 2);
+    C  = C + ridge * (trace(C) / M) * eye(M);
+    Xc = Xk - mu;
+    w    = C \ t;
+    m    = Xc * w;
+    den1 = sum(Xc .* (C \ Xc')', 2);                       % x' C^-1 x
+    den2 = t' * w;                                         % t' C^-1 t
+    s    = sign(m) .* (m .^ 2) ./ max(den1 * den2, eps);
+end
+
+function s = toolbox_ace(Xk, t, wl)
+%TOOLBOX_ACE  Opt-in Hyperspectral-add-on path (signature as documented for
+%   detectTarget; verified by co2_util('selftest') (t_toolbox_parity) when the add-on exists).
+    s = [];
+    try
+        hc = co2_make_hypercube(reshape(Xk, size(Xk, 1), 1, size(Xk, 2)), wl);
+        s  = detectTarget(hc, t, "SignedACE");
+        s  = double(s(:));
+        if numel(s) ~= size(Xk, 1), s = []; end
+    catch ME
+        warning('co2:toolboxACE', 'detectTarget path failed (%s) - using closed-form ACE.', ME.message);
+        s = [];
+    end
+end
+
+% =========================================================================
+function fl = co2_data_floor(cube, pct)
+%CO2_DATA_FLOOR  Data-driven lower clamp for -log(R).
+%   Returns the pct-th percentile of the strictly positive finite samples.
+%   (Replaces the hard-coded 1e-5, which is only meaningful for reflectance
+%   in (0,1].) Large cubes are sub-sampled to keep memory bounded.
+    x = cube(:);
+    x = x(isfinite(x) & x > 0);
+    if isempty(x)
+        error('co2:noPositiveData', 'The cube contains no positive finite samples.');
+    end
+    step = max(1, ceil(numel(x) / 2e6));
+    fl   = prctile(x(1:step:end), pct);
+end
+
+% =========================================================================
+function m = co2_eval_metrics(score, truth, mask)
+%CO2_EVAL_METRICS  Threshold-free and operating-point detection metrics.
+%
+%   m = co2_eval_metrics(score, truth)        AUC (tie-corrected Mann-Whitney),
+%                                             ROC curve, Pd at fixed Pfa
+%   m = co2_eval_metrics(score, truth, mask)  + precision / recall / F1 / IoU of mask
+%
+%   Use the SIGNED score (info.raw) so rectification ties do not distort AUC.
+    s = double(score(:));  y = logical(truth(:));
+    ok = isfinite(s);  s = s(ok);  y = y(ok);
+    P = nnz(y);  Nn = nnz(~y);
+    if P == 0 || Nn == 0, error('co2:metrics', 'Truth must contain both classes.'); end
+
+    [ss, ord] = sort(s);
+    d   = [true; diff(ss) ~= 0];
+    grp = cumsum(d);
+    cnt = accumarray(grp, 1);
+    avg = cumsum(cnt) - (cnt - 1) / 2;
+    r   = zeros(size(s));  r(ord) = avg(grp);
+    m.auc = (sum(r(y)) - P * (P + 1) / 2) / (P * Nn);
+
+    [sd, od] = sort(s, 'descend');                          % exact ROC from cumulative counts
+    yd   = y(od);
+    last = [diff(sd) ~= 0; true];                           % end of each tie group
+    tpc  = cumsum(double(yd));
+    fpc  = cumsum(double(~yd));
+    m.tpr = [0; tpc(last) / P];
+    m.fpr = [0; fpc(last) / Nn];
+
+    t3 = quantile_hi(s(~y), 1 - 1e-3);   m.pd_pfa_1e3 = mean(s(y) > t3);   % Pd at Pfa = 1e-3
+    t2 = quantile_hi(s(~y), 1 - 1e-2);   m.pd_pfa_1e2 = mean(s(y) > t2);   % Pd at Pfa = 1e-2
+
+    if nargin > 2 && ~isempty(mask)
+        mk = logical(mask(:));  mk = mk(ok);
+        tp = nnz(mk & y);  fp = nnz(mk & ~y);  fn = nnz(~mk & y);
+        m.precision = tp / max(tp + fp, 1);
+        m.recall    = tp / max(tp + fn, 1);
+        m.f1        = 2 * tp / max(2 * tp + fp + fn, 1);
+        m.iou       = tp / max(tp + fp + fn, 1);
+    end
+end
+
+function q = quantile_hi(v, p)
+    v = sort(v(:));  k = max(1, min(numel(v), ceil(p * numel(v))));  q = v(k);
+end
+
+% =========================================================================
+function [score, mask, info] = co2_finalize(raw, D, cfg)
+%CO2_FINALIZE  Post-processing shared by ALL stages (so stages are comparable).
+%
+%   raw   [rows x cols]  signed detector output (larger = more CO2-like)
+%   score [rows x cols]  rectified, median-filtered, percentile-stretched to [0,1]
+%   mask  [rows x cols]  logical hotspot mask (threshold rule in cfg.threshold,
+%                        applied to the SIGNED filtered score, then bwareaopen)
+%   info.raw             the signed filtered score (use this for ROC/AUC)
+%   info.threshold, info.coverage
+    ok  = ~D.invalid;
+    raw(~ok) = median(raw(ok));
+    raw = medfilt2(raw, cfg.median, 'symmetric');
+    info.raw = raw;
+
+    pos = max(raw, 0);
+    v   = pos(ok);
+    q   = prctile(v, cfg.normalize);
+    lo  = q(1);  hi = q(2);
+    if hi <= lo, hi = max(v);  end
+    if hi <= lo, hi = lo + 1;  end
+    score = min(max((pos - lo) / (hi - lo), 0), 1);
+    score(~ok) = 0;
+
+    thr  = co2_threshold(raw(ok), cfg.threshold);
+    mask = raw > thr & ok;
+    if cfg.threshold.minArea > 1
+        mask = bwareaopen(mask, cfg.threshold.minArea);
+    end
+    info.threshold = thr;
+    info.coverage  = 100 * nnz(mask) / nnz(ok);
+end
+
+% =========================================================================
+function co2_geo_overlay(mask, georef, outFile)
+%CO2_GEO_OVERLAY  Project a hotspot mask onto a satellite basemap (Mapping Toolbox).
+%
+%   Pixel centres are converted to UTM with CO2_PIXEL_TO_UTM, then to
+%   latitude/longitude with projinv(projcrs(EPSG), E, N). The geo-reference
+%   comes from the ENVI header (or the .mat); no scene constants live here.
+%   Saved as PNG. Synthetic scenes are skipped (they have no real location).
+    if isempty(georef) || (isfield(georef, 'isSynthetic') && georef.isSynthetic)
+        fprintf('[geo] Skipping map overlay: no real geo-reference (synthetic or missing).\n');
+        return
+    end
+    [r, c] = find(mask);
+    if isempty(r), fprintf('[geo] No hotspot pixels to map.\n'); return, end
+    [rows, cols] = size(mask);
+
+    crs = projcrs(georef.epsg);
+    [E, N]       = co2_pixel_to_utm(georef, r, c);
+    [lat, lon]   = projinv(crs, E, N);
+    cornersE = georef.UL_E + [0 cols cols 0] * georef.dx;
+    cornersN = georef.UL_N - [0 0 rows rows] * georef.dy;
+    [latC, lonC] = projinv(crs, cornersE(:), cornersN(:));
+
+    fig = figure('Name', 'Geospatial Validation', 'Color', 'w', 'Visible', 'off', ...
+                 'Position', [100 100 800 600]);
+    gx = geoaxes(fig);
+    try
+        geobasemap(gx, 'satellite');
+    catch ME
+        warning('co2:basemap', 'Satellite basemap unavailable (%s); drawing without it.', ME.message);
+    end
+    hold(gx, 'on');
+    geoscatter(gx, lat, lon, 15, 'r', 'filled', 'MarkerFaceAlpha', 0.6);
+    geolimits(gx, [min(latC) max(latC)], [min(lonC) max(lonC)]);
+    title(gx, 'Geospatial Validation - CT-ACE CO_2 hotspots', 'FontWeight', 'bold');
+    co2_save_figure(fig, outFile);
+    close(fig);
+end
+
+% =========================================================================
+function g = co2_georef_from_header(hdr)
+%CO2_GEOREF_FROM_HEADER  UTM geo-reference from an ENVI "map info" entry.
+%
+%   map info = {UTM, refX, refY, easting, northing, dx, dy, zone, North|South, datum}
+%
+%   ENVI (refX, refY) = (1,1) is the UPPER-LEFT CORNER of the first pixel.
+%   Returns [] when the header has no UTM map info.
+    g = [];
+    if ~isfield(hdr, 'map_info') || ~iscell(hdr.map_info) || numel(hdr.map_info) < 9
+        return
+    end
+    m = hdr.map_info;
+    if ~strcmpi(strtrim(m{1}), 'UTM'), return, end
+    refx = str2double(m{2});  refy = str2double(m{3});
+    E    = str2double(m{4});  N    = str2double(m{5});
+    dx   = str2double(m{6});  dy   = str2double(m{7});
+    zone = str2double(m{8});  hemi = strtrim(m{9});
+    g.UL_E = E - (refx - 1) * dx;
+    g.UL_N = N + (refy - 1) * dy;
+    g.dx = dx;  g.dy = dy;  g.zone = zone;  g.hemisphere = hemi;
+    if strcmpi(hemi, 'North'), g.epsg = 32600 + zone; else, g.epsg = 32700 + zone; end
+    g.source      = 'ENVI header map info';
+    g.isSynthetic = false;
+end
+
+% =========================================================================
+function D = co2_load_cube(source, varargin)
+%CO2_LOAD_CUBE  Load a hyperspectral cube into the repository's data struct.
+%
+%   D = co2_load_cube()                       fallback .mat in the repo root;
+%                                             if missing/invalid -> built-in
+%                                             synthetic scene (with a warning)
+%   D = co2_load_cube('file.mat')             cube + wavelengths (+ georef)
+%   D = co2_load_cube('f.img','Header','f.hdr')  raw ENVI flightline
+%   D = co2_load_cube('f.hdr')                header only (data file inferred)
+%
+%   Options: 'Crop' [r1 r2 c1 c2]|'full'  (ENVI default [1 200 1 200])
+%            'BandRange' [lo hi] nm       (ENVI only; default [1450 2150])
+%            'Strict' true|false          (error vs warning on invalid data)
+%
+%   D fields: cube [rows x cols x bands] double, wl [bands x 1] nm,
+%             invalid [rows x cols] logical, floor, georef, report, source.
+    if nargin < 1 || isempty(source)
+        D = load_default();
+        return
+    end
+    o = co2_parse_options(struct('Header', '', 'Crop', [], ...
+                                 'BandRange', [1450 2150], 'Strict', true), varargin);
+    source = char(source);
+    [~, ~, ext] = fileparts(source);
+
+    if strcmpi(ext, '.mat')
+        S = load(source, 'cube', 'wavelengths');
+        if ~isfield(S, 'cube') || ~isfield(S, 'wavelengths')
+            error('co2:load', '%s must contain the variables "cube" and "wavelengths".', source);
+        end
+        cube = double(S.cube);  wl = double(S.wavelengths(:));
+        georef = [];
+        try
+            G = load(source, 'georef');
+            if isfield(G, 'georef'), georef = G.georef; end
+        catch
+        end
+        src = source;
+    else
+        hdrFile = o.Header;
+        if isempty(hdrFile) && strcmpi(ext, '.hdr'), hdrFile = source; end
+        if isempty(hdrFile)
+            error('co2:load', 'ENVI data need a header: co2_load_cube(dataFile, ''Header'', hdrFile).');
+        end
+        [cube, wl, georef] = read_envi(source, hdrFile, o.Crop, o.BandRange);
+        o.Crop = [];                                   % already applied while reading
+        src = source;
+    end
+
+    D = co2_build_data(cube, wl, georef, src, o.Strict);
+    D = co2_crop(D, o.Crop);
+end
+
+function D = co2_build_data(cube, wl, georef, src, strict)
+%CO2_BUILD_DATA  Wrap a cube + wavelengths into the data struct used everywhere.
+%   Marks non-finite pixels (D.invalid), validates that the cube is reflectance
+%   (errors with id co2:invalidCube unless strict is false), sets the data-driven
+%   absorbance floor and the geo-reference (header / .mat / config fallback).
+    cfg = co2_config();
+    cube = double(cube);  wl = double(wl(:));
+    if size(cube, 3) ~= numel(wl)
+        error('co2:data', 'cube has %d bands but %d wavelengths were given.', size(cube, 3), numel(wl));
+    end
+    sw  = wl >= cfg.swir(1) & wl <= cfg.swir(2);
+    invalid = any(~isfinite(cube(:, :, sw)), 3);
+    if any(invalid(:))                                  % neutral fill, flagged in D.invalid
+        [r, c, b] = size(cube);
+        flat = reshape(cube, r*c, b);
+        good = ~invalid(:);
+        medspec = median(flat(good, :), 1);
+        flat(~good, :) = repmat(medspec, sum(~good), 1);
+        flat(~isfinite(flat)) = 0;
+        cube = reshape(flat, r, c, b);
+    end
+    rpt = co2_validate_cube(cube, wl);
+    if ~rpt.ok
+        msg = sprintf('%s\n  -> %s', rpt.message, ...
+              'Regenerate the data: co2_util(''prepareFallback'', ''<flightline>.hdr'') (see README, "Dataset").');
+        if strict, error('co2:invalidCube', '%s', msg);
+        else,      warning('co2:invalidCube', '%s', msg); end
+    end
+    if isempty(georef) && ~strcmp(src, 'in-memory')
+        georef = cfg.fallbackGeoref;
+        warning('co2:noGeoref', 'No geo-reference in %s - using cfg.fallbackGeoref.', src);
+    end
+    D = struct('cube', cube, 'wl', wl, 'invalid', invalid, ...
+               'floor', co2_data_floor(cube, cfg.floorPct), ...
+               'georef', georef, 'report', rpt, 'source', src, ...
+               'truth', [], 'cropWindow', [1 size(cube,1) 1 size(cube,2)]);
+end
+
+% ---------------------------------------------------------------------------
+function D = load_default()
+    f = fullfile(co2_root(), 'proposed_results.mat');
+    D = [];
+    if exist(f, 'file') == 2
+        try
+            D = co2_load_cube(f);
+        catch ME
+            warning('co2:fallbackInvalid', '%s\nUsing the built-in synthetic scene instead.', ME.message);
+        end
+    else
+        warning('co2:noFallback', 'proposed_results.mat not found - using the built-in synthetic scene.');
+    end
+    if isempty(D), D = co2_synthetic_scene(); end
+end
+
+function [cube, wl, georef] = read_envi(dataFile, hdrFile, crop, bandRange)
+    hdr = co2_parse_envi_header(hdrFile);
+    need = {'samples', 'lines', 'bands', 'data_type', 'interleave', 'wavelength'};
+    for i = 1:numel(need)
+        if ~isfield(hdr, need{i}), error('co2:header', 'Header lacks "%s".', strrep(need{i}, '_', ' ')); end
+    end
+    if exist(dataFile, 'file') ~= 2
+        error('co2:load', 'ENVI data file not found: %s', dataFile);
+    end
+    wl = hdr.wavelength(:);
+    if max(wl) < 100, wl = wl * 1000; end                   % micrometres -> nm
+    bandIdx = find(wl >= bandRange(1) & wl <= bandRange(2));
+    if isempty(bandIdx), error('co2:load', 'No bands inside BandRange.'); end
+
+    if isempty(crop), crop = [1 min(200, hdr.lines) 1 min(200, hdr.samples)]; end
+    if ischar(crop) && strcmpi(crop, 'full'), crop = [1 hdr.lines 1 hdr.samples]; end
+    crop = [max(1, crop(1)) min(hdr.lines, crop(2)) max(1, crop(3)) min(hdr.samples, crop(4))];
+
+    types = {1, 'uint8'; 2, 'int16'; 3, 'int32'; 4, 'single'; 5, 'double'; 12, 'uint16'; 13, 'uint32'};
+    k = find(cellfun(@(x) x == hdr.data_type, types(:, 1)), 1);
+    if isempty(k), error('co2:header', 'Unsupported ENVI data type %d.', hdr.data_type); end
+    if isfield(hdr, 'byte_order') && hdr.byte_order == 1, order = 'ieee-be'; else, order = 'ieee-le'; end
+    off = 0; if isfield(hdr, 'header_offset'), off = hdr.header_offset; end
+
+    cube = multibandread(dataFile, [hdr.lines hdr.samples hdr.bands], [types{k, 2} '=>single'], ...
+                         off, lower(hdr.interleave), order, ...
+                         {'Row', 'Range', crop(1:2)}, {'Column', 'Range', crop(3:4)}, ...
+                         {'Band', 'Direct', bandIdx});
+    cube = double(cube);
+    wl   = wl(bandIdx);
+
+    if isfield(hdr, 'data_ignore_value'), cube(cube == hdr.data_ignore_value) = NaN; end
+    cube(cube <= -9000) = NaN;
+    if isfield(hdr, 'reflectance_scale_factor')
+        cube = cube / hdr.reflectance_scale_factor;
+    end
+
+    georef = co2_georef_from_header(hdr);
+    if ~isempty(georef)
+        georef.UL_E = georef.UL_E + (crop(3) - 1) * georef.dx;
+        georef.UL_N = georef.UL_N - (crop(1) - 1) * georef.dy;
+    end
+end
+
+% =========================================================================
+function hc = co2_make_hypercube(cube, wl)
+%CO2_MAKE_HYPERCUBE  Build a hypercube object with the non-deprecated constructor.
+%   Uses imhypercube (R2026a+) when available and falls back to hypercube
+%   (older releases). Only needed where a hypercube OBJECT is required.
+    if exist('imhypercube', 'file') ~= 0
+        hc = imhypercube(cube, wl(:));
+    elseif exist('hypercube', 'file') ~= 0
+        hc = hypercube(cube, wl(:));
+    else
+        error('co2:noToolbox', 'Hyperspectral Imaging Library not found (imhypercube / hypercube).');
+    end
+end
+
+% =========================================================================
+function hdr = co2_parse_envi_header(file)
+%CO2_PARSE_ENVI_HEADER  Parse an ENVI .hdr text file into a struct.
+%
+%   Keys are lower-cased with non-alphanumerics turned into "_"
+%   ("map info" -> hdr.map_info, "data ignore value" -> hdr.data_ignore_value).
+%   Brace lists that parse as numbers become numeric vectors; otherwise
+%   they become cell arrays of strings (e.g. map_info).
+    if exist(file, 'file') ~= 2
+        error('co2:header', 'ENVI header not found: %s', file);
+    end
+    txt   = fileread(file);
+    lines = regexp(txt, '\r?\n', 'split');
+    hdr   = struct();
+    i = 1;
+    while i <= numel(lines)
+        ln = strtrim(lines{i});  i = i + 1;
+        k  = find(ln == '=', 1);
+        if isempty(ln) || isempty(k), continue; end
+        key = strtrim(ln(1:k-1));
+        val = strtrim(ln(k+1:end));
+        if ~isempty(val) && val(1) == '{'
+            while ~any(val == '}') && i <= numel(lines)
+                val = [val ' ' strtrim(lines{i})]; %#ok<AGROW>
+                i   = i + 1;
+            end
+        end
+        fld = lower(regexprep(key, '[^A-Za-z0-9]+', '_'));
+        fld = regexprep(fld, '^_+|_+$', '');
+        if isempty(fld) || ~isletter(fld(1)), continue; end
+        hdr.(fld) = parse_value(val);
+    end
+end
+
+function v = parse_value(val)
+    if ~isempty(val) && val(1) == '{'
+        val = strtrim(regexprep(val, '^\{|\}\s*$', ''));
+        parts = strtrim(regexp(val, ',', 'split'));
+        nums  = str2double(parts);
+        if ~isempty(parts) && ~any(isnan(nums))
+            v = nums(:)';
+        else
+            v = parts;
+        end
+    else
+        n = str2double(val);
+        if ~isnan(n), v = n; else, v = val; end
+    end
+end
+
+% =========================================================================
+function s = co2_parse_options(s, nv)
+%CO2_PARSE_OPTIONS  Minimal case-insensitive Name,Value parser.
+%   s  - struct of defaults;  nv - cell array {Name, Value, ...}
+    if mod(numel(nv), 2) ~= 0
+        error('co2:options', 'Options must be Name,Value pairs.');
+    end
+    names = fieldnames(s);
+    for i = 1:2:numel(nv)
+        k = find(strcmpi(names, nv{i}), 1);
+        if isempty(k)
+            error('co2:options', 'Unknown option "%s". Valid options: %s', ...
+                  nv{i}, strjoin(names', ', '));
+        end
+        s.(names{k}) = nv{i+1};
+    end
+end
+
+% =========================================================================
+function [E, N] = co2_pixel_to_utm(g, r, c)
+%CO2_PIXEL_TO_UTM  UTM coordinates of pixel CENTRES (r = row, c = column, 1-based).
+    E = g.UL_E + (c(:) - 0.5) * g.dx;
+    N = g.UL_N - (r(:) - 0.5) * g.dy;
+end
+
+% =========================================================================
+function [D, cfg, rest] = co2_prepare(args)
+%CO2_PREPARE  Common front end of every detector.
+%   Pulls the 'Config' and 'Crop' options out of the argument list, resolves
+%   the data source and returns the remaining (detector-specific) options.
+    cfgOv = [];  crop = [];  strict = true;  rest = {};
+    i = 1;
+    while i <= numel(args)
+        if ischar(args{i}) && strcmpi(args{i}, 'Config') && i < numel(args)
+            cfgOv = args{i+1};  i = i + 2;
+        elseif ischar(args{i}) && strcmpi(args{i}, 'Crop') && i < numel(args)
+            crop = args{i+1};   i = i + 2;
+        elseif ischar(args{i}) && strcmpi(args{i}, 'Strict') && i < numel(args)
+            strict = logical(args{i+1});  i = i + 2;
+        else
+            rest{end+1} = args{i};  i = i + 1; %#ok<AGROW>
+        end
+    end
+    [D, rest] = co2_resolve_data(rest, crop, strict);
+    cfg = co2_config(cfgOv);
+end
+
+% =========================================================================
+function [D, nv] = co2_resolve_data(args, crop, strict)
+%CO2_RESOLVE_DATA  Turn a detector's leading input argument(s) into a data struct.
+%
+%   Accepted forms (everything after the data argument is Name,Value):
+%       ()                     fallback .mat (or synthetic scene)
+%       (D)                    a struct returned by CO2_LOAD_CUBE / CO2_SYNTHETIC_SCENE
+%       ('file.mat')           cube + wavelengths
+%       ('data.img','f.hdr')   raw ENVI flightline (data file, header file)
+%       ('f.hdr')              header; data file inferred
+%       ('synthetic')          built-in scene with a known plume
+    nv = args;
+    if nargin < 2, crop = []; end
+    if nargin < 3, strict = true; end
+    if isempty(args), D = co2_load_cube();  D = co2_crop(D, crop);  return, end
+    a = args{1};
+    if isstruct(a) && isfield(a, 'cube') && isfield(a, 'wl')
+        D = co2_crop(a, crop);  nv = args(2:end);  return
+    end
+    if isnumeric(a) && ndims(a) == 3 && numel(args) >= 2 && isnumeric(args{2})   % (cube, wavelengths)
+        D = co2_crop(co2_build_data(a, args{2}, [], 'in-memory', strict), crop);
+        nv = args(3:end);  return
+    end
+    if ischar(a) || (exist('isstring', 'builtin') && isstring(a))
+        a = char(a);
+        if strcmpi(a, 'synthetic')
+            D = co2_crop(co2_synthetic_scene(), crop);  nv = args(2:end);  return
+        end
+        if looks_like_path(a)
+            if numel(args) >= 2 && ischar(args{2}) && is_header(args{2})
+                D = co2_load_cube(a, 'Header', args{2}, 'Crop', crop, 'Strict', strict);  nv = args(3:end);
+            else
+                D = co2_load_cube(a, 'Crop', crop, 'Strict', strict);      nv = args(2:end);
+            end
+            return
+        end
+    end
+    D  = co2_crop(co2_load_cube(), crop);                 % all args are options
+end
+
+function tf = looks_like_path(a)
+    [~, ~, e] = fileparts(a);
+    tf = exist(a, 'file') == 2 || any(strcmpi(e, {'.mat', '.hdr', '.img', '.dat', '.bin', '.bsq', '.bil', '.bip'}));
+end
+
+function tf = is_header(a)
+    [~, ~, e] = fileparts(a);
+    tf = strcmpi(e, '.hdr');
+end
+
+% =========================================================================
+function root = co2_root()
+%CO2_ROOT  Absolute path of the repository root (folder that contains lib/).
+%   Resolved from this file's own location, never from pwd, so every script
+%   behaves identically no matter where MATLAB was started.
+    root = fileparts(fileparts(mfilename('fullpath')));
+end
+
+% =========================================================================
+function co2_save_figure(fig, file)
+%CO2_SAVE_FIGURE  Save a figure (PNG) creating the folder if needed.
+    d = fileparts(file);
+    if ~isempty(d) && exist(d, 'dir') ~= 7, mkdir(d); end
+    try
+        exportgraphics(fig, file, 'Resolution', 200);
+    catch
+        saveas(fig, file);
+    end
+end
+
+% =========================================================================
+function D = co2_synthetic_scene(varargin)
+%CO2_SYNTHETIC_SCENE  Reflectance scene with a KNOWN injected CO2 plume.
+%
+%   D = co2_synthetic_scene('Amplitude', 0.04, 'SNR', 250, 'Seed', 7)
+%
+%   Background : NumClasses smooth surface-reflectance classes laid out as
+%                spatially coherent regions, with per-pixel brightness and
+%                tilt variability and relative sensor noise (1/SNR).
+%   Plume      : anisotropic Gaussian optical-depth footprint multiplied
+%                into the reflectance (Beer-Lambert),  R' = R * exp(-tau).
+%   Signature  : injected with lines at 1573, 1602, 1960, 2005, 2058 nm
+%                (sigma 6 nm). It deliberately DIFFERS from the detection
+%                template (1575/2005 nm, sigma 15/12 nm) so detectors are not
+%                scored on their own template ("inverse crime").
+%   D.truth    : logical mask of pixels with tau >= 25 % of the peak.
+%
+%   This scene is a controlled test bench, NOT a substitute for validation
+%   on a real flightline over a known source.
+    o = co2_parse_options(struct('Size', [200 200], 'Seed', 7, 'Amplitude', 0.04, ...
+            'SNR', 250, 'Wavelengths', [], 'PlumeSigma', [18 7], 'PlumeAngle', 30, ...
+            'NumClasses', 5), varargin);
+    rng(o.Seed);
+    rows = o.Size(1);  cols = o.Size(2);  N = rows * cols;
+    wl = o.Wavelengths;
+    if isempty(wl), wl = linspace(378.93, 2498.34, 224)'; end
+    wl = wl(:);  B = numel(wl);
+
+    % spatially coherent class map
+    kk = exp(-0.5 * ((-15:15) / 8).^2);  kk = kk / sum(kk);
+    F  = zeros(rows, cols, o.NumClasses);
+    for q = 1:o.NumClasses
+        F(:, :, q) = conv2(conv2(randn(rows, cols), kk, 'same'), kk', 'same');
+    end
+    [~, lab] = max(F, [], 3);
+
+    % smooth class spectra
+    x  = (wl - 1300) / 1200;
+    Rc = zeros(B, o.NumClasses);
+    for q = 1:o.NumClasses
+        c0 = log(0.15 + 0.30 * rand);
+        lr = c0 + 0.6*randn*x + 0.3*randn*x.^2 + 0.2*randn*x.^3;
+        Rc(:, q) = min(max(exp(lr), 0.03), 0.8);
+    end
+    X = Rc(:, lab(:))';                                           % N x B
+
+    bright = exp(0.12 * reshape(conv2(conv2(randn(rows, cols), kk, 'same'), kk', 'same'), N, 1) ...
+                 + 0.05 * randn(N, 1));
+    tilt   = exp(0.05 * randn(N, 1) * x');                        % N x B
+    X = X .* bright .* tilt;
+
+    % plume (known optical depth)
+    [XX, YY] = meshgrid(1:cols, 1:rows);
+    xc = 0.60 * cols;  yc = 0.45 * rows;  th = o.PlumeAngle * pi / 180;
+    xr =  (XX - xc) * cos(th) + (YY - yc) * sin(th);
+    yr = -(XX - xc) * sin(th) + (YY - yc) * cos(th);
+    gmap = exp(-0.5 * ((xr / o.PlumeSigma(1)).^2 + (yr / o.PlumeSigma(2)).^2));
+
+    c = [1573 1602 1960 2005 2058];  a = [0.12 0.25 0.30 1.00 0.75];
+    sg = zeros(B, 1);
+    for k = 1:numel(c), sg = sg + a(k) * exp(-0.5 * ((wl - c(k)) / 6).^2); end
+    sg = sg / max(sg);
+    X  = X .* exp(-o.Amplitude * (gmap(:) * sg'));
+
+    X = X + X .* randn(N, B) / o.SNR;                              % relative sensor noise
+    X = max(X, 1e-4);
+
+    cfg = co2_config();
+    cube = reshape(X, rows, cols, B);
+    g = cfg.fallbackGeoref;  g.source = 'synthetic scene';  g.isSynthetic = true;
+    D = struct('cube', cube, 'wl', wl, 'invalid', false(rows, cols), ...
+               'floor', co2_data_floor(cube, cfg.floorPct), 'georef', g, ...
+               'report', co2_validate_cube(cube, wl), 'source', 'synthetic', ...
+               'truth', gmap >= 0.25, 'plumeTau', o.Amplitude * gmap, ...
+               'cropWindow', [1 rows 1 cols]);
+end
+
+% =========================================================================
+function t = co2_target_from_transmittance(wl, wl_hi, T_hi, fwhm)
+%CO2_TARGET_FROM_TRANSMITTANCE  Physics-based template from a transmittance.
+%
+%   t = co2_target_from_transmittance(wl, wl_hi, T_hi, fwhm)
+%
+%   wl    - sensor band centres (nm)
+%   wl_hi - fine wavelength grid of a MODTRAN / HITRAN / LBLRTM CO2-only
+%           transmittance spectrum T_hi (0..1)
+%   fwhm  - sensor spectral response FWHM (nm), Gaussian
+%
+%   Optical depth tau = -log(T) is convolved with the sensor response,
+%   sampled at the band centres, mean-removed and L2-normalised.
+    wl = wl(:);  wl_hi = wl_hi(:);
+    tau = -log(max(T_hi(:), 1e-6));
+    s   = fwhm / (2 * sqrt(2 * log(2)));
+    t   = zeros(numel(wl), 1);
+    for b = 1:numel(wl)
+        r    = exp(-0.5 * ((wl_hi - wl(b)) / s).^2);
+        t(b) = sum(r .* tau) / sum(r);
+    end
+    t = t - mean(t);
+    t = t / (norm(t) + eps);
+end
+
+% =========================================================================
+function thr = co2_threshold(v, th)
+%CO2_THRESHOLD  Detection threshold from a vector of (signed) scores.
+%   th.rule = 'percentile' : prctile(v, th.value)            (default, 95)
+%             'madz'       : median + th.value * 1.4826*MAD   (robust z-score)
+%             'otsu'       : Otsu on the min-max scaled scores (reference only)
+    v = v(:);  v = v(isfinite(v));
+    switch lower(th.rule)
+        case 'percentile'
+            thr = prctile(v, th.value);
+        case 'madz'
+            m = median(v);  s = 1.4826 * median(abs(v - m));
+            thr = m + th.value * max(s, eps);
+        case 'otsu'
+            lo = min(v);  hi = max(v);
+            thr = lo + graythresh((v - lo) / max(hi - lo, eps)) * (hi - lo);
+        otherwise
+            error('co2:threshold', 'Unknown threshold rule "%s".', th.rule);
+    end
+end
+
+% =========================================================================
+function rpt = co2_validate_cube(cube, wl)
+%CO2_VALIDATE_CUBE  Sanity-check that a cube is surface reflectance.
+%
+%   rpt = co2_validate_cube(cube, wl)
+%
+%   Looks at the SWIR window only and reports
+%     fracNonFinite, fracZero, p01, median, p99, ok, message
+%   A cube is accepted when <1 % of samples are non-finite, <2 % are exactly
+%   zero, the median is in (0.005, 1.5) and the 99th percentile <= 2.
+%   (A real reflectance cube never has most of its SWIR samples equal to 0.)
+    sw = wl(:) >= 1500 & wl(:) <= 2100;
+    if ~any(sw), error('co2:validate', 'No bands in 1500-2100 nm.'); end
+    x = cube(:, :, sw);  x = x(:);
+    rpt.fracNonFinite = mean(~isfinite(x));
+    x = x(isfinite(x));
+    rpt.fracZero = mean(x == 0);
+    q = prctile(x, [1 50 99]);
+    rpt.p01 = q(1);  rpt.median = q(2);  rpt.p99 = q(3);
+    msg = {};
+    if rpt.fracNonFinite > 0.01, msg{end+1} = sprintf('%.1f %% non-finite samples', 100*rpt.fracNonFinite); end
+    if rpt.fracZero      > 0.02, msg{end+1} = sprintf('%.1f %% of SWIR samples are exactly 0', 100*rpt.fracZero); end
+    if rpt.median <= 0.005 || rpt.median >= 1.5
+        msg{end+1} = sprintf('median %.3g is outside the plausible reflectance range', rpt.median);
+    end
+    if rpt.p99 > 2, msg{end+1} = sprintf('99th percentile %.3g > 2 (scaled integers?)', rpt.p99); end
+    rpt.ok      = isempty(msg);
+    if rpt.ok, rpt.message = 'cube looks like surface reflectance';
+    else,      rpt.message = ['cube is not valid reflectance: ' strjoin(msg, '; ')]; end
+end
+
+% =========================================================================
+function out = co2_prepare_fallback(hdrFile, varargin)
+%CO2_PREPARE_FALLBACK  Build a VALID proposed_results.mat from a raw ENVI flightline.
+%
+%   co2_util('prepareFallback', 'f250923t01p00r13_rfl.hdr')
+%   co2_util('prepareFallback', hdr, 'DataFile', 'f..._rfl', 'Crop', [1 200 1 200], ...
+%                               'Output', <repo>/proposed_results.mat)
+%
+%   * reads reflectance through the ENVI header (no-data -> NaN, scale factor applied);
+%   * REFUSES to save if the cube is not valid reflectance (co2_validate_cube);
+%   * saves ONLY cube (single), wavelengths and georef (from the header), so stale
+%     score variables (cibrScore, ctmfScore, binaryMask, ...) cannot be carried along.
+    o = co2_parse_options(struct('DataFile', '', 'Crop', [1 200 1 200], ...
+            'Output', fullfile(co2_root(), 'proposed_results.mat')), varargin);
+    dataFile = o.DataFile;
+    if isempty(dataFile)
+        base = regexprep(hdrFile, '\.hdr$', '');
+        for e = {'', '.img', '.dat', '.bsq', '.bil', '.bip'}
+            if exist([base e{1}], 'file') == 2, dataFile = [base e{1}]; break, end
+        end
+    end
+    if isempty(dataFile), error('prepare:data', 'Could not find the data file next to %s.', hdrFile); end
+    D = co2_load_cube(dataFile, 'Header', hdrFile, 'Crop', o.Crop, ...
+                      'BandRange', [0 3000], 'Strict', true);
+    cube        = single(D.cube);    %#ok<NASGU>
+    wavelengths = D.wl;              %#ok<NASGU>
+    georef      = D.georef;          %#ok<NASGU>
+    save(o.Output, 'cube', 'wavelengths', 'georef', '-v7.3');
+    fprintf('Saved %s (%d x %d x %d). %s\n', o.Output, size(D.cube, 1), size(D.cube, 2), ...
+            size(D.cube, 3), D.report.message);
+    out = o.Output;
+end
+
+% =========================================================================
+function co2_selftest()
+%CO2_SELFTEST  Self-contained regression tests: co2_util('selftest').
+%   Covers the reviewer-reported defects: paths, units gate, georeferencing,
+%   reproducibility, single CT-ACE, no-argument entry point, ROC/AUC metrics.
+    addpath(fileparts(mfilename('fullpath')));
+    warning('off', 'co2:noGeoref');
+    T = {@t_config_and_target, @t_absorbance_floor, @t_validation_flags_bad_cube, ...
+         @t_envi_header_and_georef, @t_mat_loader, @t_pixel_centres, @t_crop_bounds, ...
+         @t_metrics, @t_detectors_shapes, @t_inmemory_interface, @t_reproducible, ...
+         @t_noarg_entrypoint, @t_detection_quality, @t_single_ctace_implementation, ...
+         @t_toolbox_parity};
+    nFail = 0;
+    for i = 1:numel(T)
+        name = func2str(T{i});
+        try
+            msg = T{i}();
+            if isempty(msg), msg = 'ok'; end
+            fprintf('PASS  %-34s %s\n', name, msg);
+        catch ME
+            nFail = nFail + 1;
+            fprintf('FAIL  %-34s %s\n', name, ME.message);
+        end
+    end
+    if nFail > 0, error('co2:tests', '%d test(s) failed.', nFail); end
+    fprintf('\nAll %d tests passed.\n', numel(T));
+end
+
+function m = t_inmemory_interface()
+    D = co2_synthetic_scene('Size', [50 50]);
+    [a, k] = co2_cibr(D.cube, D.wl);            % original (cube, wavelengths) signature
+    [b, ~] = computectmf(D.cube, D.wl);
+    assert(isequal(size(a), [50 50]) && islogical(k) && isequal(size(b), [50 50]), 'in-memory form');
+    ok = false;
+    try, co2_cibr(D.cube * 1e-5, D.wl); catch ME, ok = strcmp(ME.identifier, 'co2:invalidCube'); end
+    assert(ok, 'a cube at the 1e-5 scale must be rejected, not silently processed');
+    m = '';
+end
+
+% =========================================================================
+function m = t_config_and_target()
+    cfg = co2_config();  wl = (1500:10:2100)';
+    t = co2_build_target(wl, cfg);
+    assert(abs(norm(t) - 1) < 1e-12, 'template must be L2-normalised');
+    [~, i] = max(t);  assert(abs(wl(i) - 2005) <= 10, 'template peak must sit near 2005 nm');
+    m = '';
+end
+
+function m = t_absorbance_floor()
+    R = [0 0 1e-5 0.2 0.5 0.9]';  fl = co2_data_floor(R, 0.5);
+    assert(fl > 0 && fl <= 1e-5 + eps, 'floor must come from positive data');
+    [A, i] = co2_absorbance([0.1 0.5]', 0.01);
+    assert(abs(A(1) + log(0.1)) < 1e-12 && i.clampedFrac == 0, 'natural-log absorbance');
+    m = '';
+end
+
+function m = t_validation_flags_bad_cube()
+    wl = linspace(380, 2500, 224)';
+    bad = zeros(20, 20, 224);  bad(rand(20, 20, 224) > 0.6) = 3e-5;   % like the shipped cube
+    r = co2_validate_cube(bad, wl);
+    assert(~r.ok, 'a cube that is mostly zeros must be rejected');
+    good = co2_synthetic_scene('Size', [30 30]);
+    assert(good.report.ok, 'synthetic scene must validate');
+    m = sprintf('(bad: %s)', r.message(1:min(40, end)));
+end
+
+function m = t_envi_header_and_georef()
+    f = [tempname() '.hdr'];
+    fid = fopen(f, 'w');
+    fprintf(fid, 'ENVI\nsamples = 10\nlines = 8\nbands = 3\nheader offset = 0\ndata type = 4\n');
+    fprintf(fid, 'interleave = bil\nbyte order = 0\ndata ignore value = -9999\n');
+    fprintf(fid, 'map info = {UTM, 1.000, 1.000, 577561.59, 4228899.2, 14.4, 14.4, 11, North, WGS-84}\n');
+    fprintf(fid, 'wavelength = {\n 1500.0, 1510.5,\n 1520.2}\n');
+    fclose(fid);
+    h = co2_parse_envi_header(f);  delete(f);
+    assert(h.samples == 10 && h.lines == 8 && h.bands == 3, 'scalars');
+    assert(numel(h.wavelength) == 3 && abs(h.wavelength(3) - 1520.2) < 1e-9, 'multi-line wavelength list');
+    g = co2_georef_from_header(h);
+    assert(abs(g.UL_E - 577561.59) < 1e-9 && abs(g.UL_N - 4228899.2) < 1e-9 && g.epsg == 32611, 'georef');
+    m = '';
+end
+
+function m = t_mat_loader()
+    D = co2_synthetic_scene('Size', [30 30]);
+    cube = single(D.cube);  wavelengths = D.wl;  %#ok<NASGU>
+    good = [tempname() '.mat'];  save('-v7', good, 'cube', 'wavelengths');
+    L = co2_load_cube(good);  delete(good);
+    assert(isequal(size(L.cube), size(D.cube)) && L.floor > 0, 'valid .mat must load');
+    cube = zeros(30, 30, 224, 'single');  cube(rand(30, 30, 224) > 0.6) = 3e-5;
+    bad = [tempname() '.mat'];  save('-v7', bad, 'cube', 'wavelengths');
+    id = '';
+    try, co2_load_cube(bad); catch ME, id = ME.identifier; end
+    delete(bad);
+    assert(strcmp(id, 'co2:invalidCube'), 'a mostly-zero 1e-5 cube (like the shipped file) must be rejected');
+    m = '';
+end
+
+function m = t_pixel_centres()
+    g = struct('UL_E', 1000, 'UL_N', 5000, 'dx', 10, 'dy', 10);
+    [E, N] = co2_pixel_to_utm(g, [1; 2], [1; 3]);
+    assert(isequal(E, [1005; 1025]) && isequal(N, [4995; 4985]), 'pixel-centre arithmetic');
+    D = co2_synthetic_scene('Size', [40 40]);  D.georef = g;
+    D2 = co2_crop(D, [11 30 6 25]);
+    assert(D2.georef.UL_E == 1050 && D2.georef.UL_N == 4900, 'geo-reference origin moves with the crop');
+    m = '';
+end
+
+function m = t_crop_bounds()
+    D = co2_synthetic_scene('Size', [40 40]);
+    warning('off', 'co2:cropClipped');
+    D2 = co2_crop(D, [1 500 1 500]);
+    warning('on', 'co2:cropClipped');
+    assert(isequal(size(D2.cube(:, :, 1)), [40 40]), 'oversized crop must be clipped');
+    ok = false;
+    try, co2_crop(D, [50 60 1 10]); catch, ok = true; end
+    assert(ok, 'empty crop window must raise an error');
+    m = '';
+end
+
+function m = t_metrics()
+    y = [true(50, 1); false(950, 1)];
+    perfect = co2_eval_metrics([ones(50, 1); zeros(950, 1)], y);
+    assert(abs(perfect.auc - 1) < 1e-12, 'perfect separation -> AUC 1');
+    ties = co2_eval_metrics(zeros(1000, 1), y);
+    assert(abs(ties.auc - 0.5) < 1e-12, 'all-tied scores -> AUC 0.5 (tie-corrected)');
+    rng(3);  r = co2_eval_metrics(randn(1000, 1), y);
+    assert(abs(r.auc - 0.5) < 0.1, 'random scores -> AUC near 0.5');
+    m = sprintf('(random AUC %.2f)', r.auc);
+end
+
+function m = t_detectors_shapes()
+    D = co2_synthetic_scene('Size', [60 60]);
+    fns = {@co2_cibr, @co2_jrge, @co2_sfa, @computectmf, @co2_baseline_mf};
+    for i = 1:numel(fns)
+        [s, k, info] = fns{i}(D);
+        assert(isequal(size(s), [60 60]) && isequal(size(k), [60 60]), 'sizes');
+        assert(islogical(k) && all(isfinite(s(:))) && min(s(:)) >= 0 && max(s(:)) <= 1, 'ranges');
+        assert(all(isfinite(info.raw(:))), 'raw finite');
+        assert(info.coverage < 15, sprintf('%s: coverage %.1f %% is not a plume footprint', func2str(fns{i}), info.coverage));
+    end
+    m = '';
+end
+
+function m = t_reproducible()
+    D = co2_synthetic_scene('Size', [60 60]);
+    a = computectmf(D);  b = computectmf(D);
+    assert(isequal(a, b), 'two runs on the same data must be bit-identical (fixed seed)');
+    m = '';
+end
+
+function m = t_noarg_entrypoint()
+    w = warning('off', 'all');
+    [s, k] = computectmf();
+    warning(w);
+    assert(ismatrix(s) && islogical(k) && any(k(:)), 'computectmf() with no arguments must run');
+    m = '';
+end
+
+function m = t_detection_quality()
+    D = co2_synthetic_scene('Amplitude', 0.06, 'Seed', 11);
+    [~, ~, ic] = computectmf(D);    mc = co2_eval_metrics(ic.raw, D.truth);
+    [~, ~, ib] = co2_baseline_mf(D); mb = co2_eval_metrics(ib.raw, D.truth);
+    assert(mc.auc > 0.9, sprintf('CT-ACE AUC %.3f too low on a strong synthetic plume', mc.auc));
+    m = sprintf('(AUC CT-ACE %.3f | global MF %.3f)', mc.auc, mb.auc);
+end
+
+function m = t_single_ctace_implementation()
+    pat  = ['sign(m) .* (m .' '^ 2)'];                      % built in pieces so this test does not match itself
+    root = co2_root();
+    hits = {};
+    d = [dir(fullfile(root, 'core algorithms', '*.m')); dir(fullfile(root, 'src', '*.m'))];
+    for i = 1:numel(d)
+        if strcmp(d(i).name, 'co2_util.m'), continue, end
+        if ~isempty(strfind(fileread(fullfile(d(i).folder, d(i).name)), pat)) %#ok<STREMP>
+            hits{end+1} = d(i).name; %#ok<AGROW>
+        end
+    end
+    n = numel(strfind(fileread(fullfile(root, 'core algorithms', 'co2_util.m')), pat));
+    assert(isempty(hits) && n == 1, ...
+           'the ACE statistic must exist exactly once, in co2_util.m (found %d times there; also in: %s)', n, strjoin(hits, ', '));
+    m = '';
+end
+
+function m = t_toolbox_parity()
+    if exist('detectTarget', 'file') == 0 || (exist('imhypercube', 'file') == 0 && exist('hypercube', 'file') == 0)
+        m = '(skipped: Hyperspectral add-on not installed)';  return
+    end
+    D = co2_synthetic_scene('Size', [50 50]);
+    c1 = co2_config();  c2 = co2_config(struct('ctace', struct('useToolbox', true)));
+    [~, ~, a] = computectmf(D, 'Config', c1);
+    [~, ~, b] = computectmf(D, 'Config', c2);
+    r = corr(a.raw(:), b.raw(:));
+    assert(r > 0.99, sprintf('toolbox and closed-form ACE disagree (r = %.3f)', r));
+    m = sprintf('(r = %.4f)', r);
+end
