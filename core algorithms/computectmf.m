@@ -12,14 +12,7 @@ function [mf_image, hotspot_mask, info] = computectmf(varargin)
 %   [...] = computectmf(D)                     struct from CO2_LOAD_CUBE
 %   [...] = computectmf('synthetic')
 %   Options: 'Config', struct | 'Crop', [r1 r2 c1 c2]|'full' | 'Overlay', false
-%
-%   Pipeline: SWIR band selection (1500-2100 nm, 1800-1950 nm water excluded)
-%             -> absorbance -log(R) (natural log, data-driven floor)
-%             -> K-means (cfg.ctace.K, fixed seed)
-%             -> per-cluster signed ACE (CO2_CT_ACE)
-%             -> shared post-processing (CO2_FINALIZE).
-%   Setting cfg.ctace.absorbance = false or cfg.ctace.K = 1 gives the
-%   ablation variants used in src/run_validation.m.
+
     U = co2_util();
     [D, cfg, rest] = U.prepare(varargin);
     o = U.opts(struct('Overlay', false), rest);
