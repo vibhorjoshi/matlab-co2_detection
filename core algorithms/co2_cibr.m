@@ -1,49 +1,36 @@
-function [co2_index, hotspot_mask] = co2_cibr(cube, wavelengths)
-%CO2_CIBR  Continuum Interpolated Band Ratio for CO2 detection (~2005 nm)
+function [co2_index, hotspot_mask, info] = co2_cibr(varargin)
+%CO2_CIBR  Stage 1 - Continuum Interpolated Band Ratio (three-band).
+%   [co2_index, hotspot_mask, info] = co2_cibr(cube, wavelengths)   HxWxB reflectance cube, Bx1 band centres (nm)
 %
-%   [co2_index, hotspot_mask] = co2_cibr(cube, wavelengths)
+%   [co2_index, hotspot_mask, info] = co2_cibr()                 fallback data
+%   [...] = co2_cibr('file.mat')  |  co2_cibr('f.img','f.hdr')  |  co2_cibr(D)
+%   Options: 'Config', struct | 'Crop', [r1 r2 c1 c2] | 'full'
 %
-% Inputs
-%   cube         HxWxB hyperspectral cube (reflectance or radiance)
-%   wavelengths  Bx1 band centres in nanometres
+%   Band centres (cfg.cibr, nm):  left 1980 | absorption 2005 | right 2030.
+%   The continuum at the absorption band is linearly interpolated in
+%   wavelength between the shoulders, and the score is the fractional band depth
+%       CIBR = 1 - R_A / C_A ,   C_A = R_L + (R_R - R_L) (l_A - l_L)/(l_R - l_L)
+%   (positive where the surface absorbs below its local continuum).
 %
-% Outputs
-%   co2_index    HxW normalised score map in [0,1]
-%   hotspot_mask HxW logical mask (95th percentile + bwareaopen)
-
-    if nargin < 2
-        error('co2_cibr:NotEnoughInputs', 'Provide cube and wavelengths.');
+%   OUTPUT  co2_index    [rows x cols] score in [0,1]
+%           hotspot_mask [rows x cols] logical (cfg.threshold rule + bwareaopen)
+%           info.raw     signed filtered score (for ROC/AUC), info.bands, ...
+    U = co2_util();
+    [D, cfg, ~] = U.prepare(varargin);
+    wl = D.wl(:);
+    [~, iL] = min(abs(wl - cfg.cibr.left));
+    [~, iA] = min(abs(wl - cfg.cibr.center));
+    [~, iR] = min(abs(wl - cfg.cibr.right));
+    if ~(iL < iA && iA < iR)
+        error('co2:cibr', 'CIBR needs left < centre < right bands; the cube has %.0f/%.0f/%.0f nm.', ...
+              wl(iL), wl(iA), wl(iR));
     end
-
-    wavelengths = wavelengths(:);
-    [H, W, ~] = size(cube);
-
-    % Continuum bands around the strong CO2 feature
-    left_wl  = 1980;
-    abs_wl   = 2005;
-    right_wl = 2030;
-
-    [~, iL] = min(abs(wavelengths - left_wl));
-    [~, iA] = min(abs(wavelengths - abs_wl));
-    [~, iR] = min(abs(wavelengths - right_wl));
-
-    L = double(cube(:,:,iL));
-    A = double(cube(:,:,iA));
-    R = double(cube(:,:,iR));
-
-    continuum = (L + R) / 2;
-    cibr = continuum - A;
-    cibr = max(cibr, 0);                 % rectify negative values
-
-    cibr = medfilt2(cibr, [3 3]);
-
-    mx = max(cibr(:));
-    if mx > 0
-        co2_index = cibr / mx;
-    else
-        co2_index = zeros(H, W);
-    end
-
-    thr = prctile(co2_index(:), 95);
-    hotspot_mask = bwareaopen(co2_index > thr, 10);
+    wA = (wl(iA) - wl(iL)) / (wl(iR) - wl(iL));
+    RL = D.cube(:, :, iL);  RA = D.cube(:, :, iA);  RR = D.cube(:, :, iR);
+    CA = RL + (RR - RL) * wA;
+    raw = 1 - RA ./ max(CA, D.floor);
+ 
+    [co2_index, hotspot_mask, fin] = U.finalize(raw, D, cfg);
+    info = fin;
+    info.bands = wl([iL iA iR]);
 end
