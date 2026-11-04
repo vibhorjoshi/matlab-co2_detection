@@ -1,56 +1,55 @@
-function [gas_map, binary_hotspots] = co2_jrge(cube, wavelengths)
-%CO2_JRGE  Joint Reflectance and Gas Estimation (iterative continuum residual)
+function [gas_map, hotspot_mask, info] = co2_jrge(varargin)
+%CO2_JRGE  Stage 2 - Joint Reflectance and Gas Estimation.
+%   [gas_map, hotspot_mask, info] = co2_jrge(cube, wavelengths)   HxWxB reflectance cube, Bx1 band centres (nm)
 %
-%   [gas_map, binary_hotspots] = co2_jrge(cube, wavelengths)
+%   [gas_map, hotspot_mask, info] = co2_jrge(cube, wavelengths)   (same inputs as co2_cibr)
 %
-% Operates in the 2000-2100 nm window. Accumulates gas-column estimate
-% over three iterations of continuum residual fitting.
+%   Beer-Lambert model in absorbance space, A(l) = -log R(l):
+%       A(l) = b(l) + g * t(l)
+%   b : smooth surface background (polynomial of degree cfg.jrge.degree)
+%   t : CO2 template, g : gas column (template-normalised units, signed)
+%   The background is fitted ONLY on bands outside +/- cfg.jrge.guard nm of the
+%   template centres (so the gas feature cannot be absorbed by the fit); the
+%   gas column is the template-weighted absorbance residual
+%       g = <t, A - b> / <t, t> .
+%   cfg.jrge.iterations refits b after removing the current gas estimate.
+%   Fully vectorised (chunked); needs no Curve Fitting Toolbox.
+    U = co2_util();
+    [D, cfg, ~] = U.prepare(varargin);
+    j   = cfg.jrge;
+    sel = U.bands(D.wl, cfg);
+    wls = D.wl(sel);  M = numel(wls);
+    [rows, cols, ~] = size(D.cube);  N = rows * cols;
 
-    if nargin < 2
-        error('co2_jrge:NotEnoughInputs', 'Provide cube and wavelengths.');
+    R2 = reshape(D.cube(:, :, sel), N, M);
+    A  = U.absorbance(R2, D.floor);
+    t  = U.target(wls, cfg);
+
+    x  = (wls - mean(wls)) / (0.5 * (max(wls) - min(wls)));
+    B  = x(:) .^ (0:j.degree);                              % M x (deg+1)
+    sh = true(M, 1);
+    for k = 1:numel(cfg.template.center)
+        sh = sh & abs(wls - cfg.template.center(k)) > j.guard;
     end
-
-    wavelengths = wavelengths(:);
-    [H, W, ~] = size(cube);
-
-    band_mask = wavelengths >= 2000 & wavelengths <= 2100;
-    if sum(band_mask) < 5
-        band_mask = wavelengths >= 1950 & wavelengths <= 2150;
+    if nnz(sh) < j.degree + 3
+        error('co2:jrge', 'Too few shoulder bands (%d) for a degree-%d background.', nnz(sh), j.degree);
     end
-    X = double(cube(:,:,band_mask));
-    nBands = size(X, 3);
+    P  = pinv(B(sh, :));                                    % (deg+1) x nShoulder
 
-    gasCol = zeros(H, W);
-    nIter  = 3;
-    scale  = 0.05;
-
-    for t = 1:nIter
-        % Linear continuum between first and last band of the window
-        C = zeros(H, W, nBands);
-        for b = 1:nBands
-            alpha = (b-1) / max(nBands-1, 1);
-            C(:,:,b) = (1-alpha)*X(:,:,1) + alpha*X(:,:,end);
+    g = zeros(N, 1);
+    for s0 = 1:j.chunk:N
+        ii = s0:min(N, s0 + j.chunk - 1);
+        Ai = A(ii, :);  gi = zeros(numel(ii), 1);
+        for it = 1:j.iterations
+            Y    = Ai - gi * t';
+            coef = Y(:, sh) * P';                           % N x (deg+1)
+            gi   = ((Ai - coef * B') * t) / (t' * t);
         end
-
-        residual = max(C - X, 0);                 % absorption only
-        sumRes   = sum(residual, 3);
-        tau      = scale * sumRes / nBands;
-        gasCol   = gasCol + tau;
-
-        % Remove estimated gas contribution
-        shape = residual ./ max(sumRes, 1e-8);
-        for b = 1:nBands
-            X(:,:,b) = X(:,:,b) + tau .* shape(:,:,b);
-        end
+        g(ii) = gi;
     end
 
-    mx = max(gasCol(:));
-    if mx > 0
-        gas_map = gasCol / mx;
-    else
-        gas_map = zeros(H, W);
-    end
-
-    thr = prctile(gas_map(:), 95);
-    binary_hotspots = bwareaopen(gas_map > thr, 10);
+    [gas_map, hotspot_mask, fin] = U.finalize(reshape(g, rows, cols), D, cfg);
+    info = fin;
+    info.shoulderBands = nnz(sh);
+    info.fractionPositive = mean(fin.raw(:) > 0);
 end
