@@ -1,50 +1,37 @@
-function [co2_map, binary_map] = co2_sfa(cube, wavelengths)
-%CO2_SFA  Spectral Fitting Algorithm – correlation with dual-band CO2 template
+function [co2_map, hotspot_mask, info] = co2_sfa(varargin)
+%CO2_SFA  Stage 3 - Spectral Fitting Algorithm on continuum-removed spectra.
+%   [co2_map, hotspot_mask, info] = co2_sfa(cube, wavelengths)   HxWxB reflectance cube, Bx1 band centres (nm)
 %
-%   [co2_map, binary_map] = co2_sfa(cube, wavelengths)
+%   [co2_map, hotspot_mask, info] = co2_sfa(cube, wavelengths)   (same inputs as co2_cibr)
 %
-% Template is a dual Gaussian centred at 1575 nm and 2005 nm (L2-normalised).
-% Matching is performed after mean-centring both the observed spectrum and
-% the template so that the continuum shape does not dominate the score.
+%   Root-cause fix: matching a narrow absorption template against RAW
+%   reflectance is dominated by the continuum level and slope (hence the old
+%   SBR < 1). Here every absorption window of cfg.features gets a local
+%   straight-line continuum (see CO2_CONTINUUM_TAU), the spectra become
+%   optical depth  tau = -log(R/continuum), and the template is matched to
+%   tau, so the score reflects absorption depth only.
+%
+%   cfg.sfa.score = 'cosine'    cosine similarity (SAM-equivalent, scale-free)
+%                 = 'amplitude' least-squares template amplitude <t,tau>
+%   The SAM/cosine is computed directly; the add-on's spectralMatch is NOT
+%   needed (its API takes a reference-library struct, not a numeric vector).
+    U = co2_util();
+    [D, cfg, ~] = U.prepare(varargin);
+    wl = D.wl(:);
+    [rows, cols, B] = size(D.cube);  N = rows * cols;
+    R2 = reshape(D.cube, N, B);
 
-    if nargin < 2
-        error('co2_sfa:NotEnoughInputs', 'Provide cube and wavelengths.');
+    [tau, idx] = U.contTau(R2, wl, cfg.features, cfg.nShoulder, D.floor);
+    t = U.target(wl(idx), cfg);
+
+    amp = tau * t;                                           % <t, tau>, ||t|| = 1
+    switch lower(cfg.sfa.score)
+        case 'cosine',    raw = amp ./ (sqrt(sum(tau .^ 2, 2)) + eps);
+        case 'amplitude', raw = amp;
+        otherwise, error('co2:sfa', 'Unknown cfg.sfa.score "%s".', cfg.sfa.score);
     end
 
-    wavelengths = wavelengths(:);
-    [H, W, ~] = size(cube);
-
-    band_mask = wavelengths >= 1500 & wavelengths <= 2100;
-    if sum(band_mask) < 10
-        band_mask = true(size(wavelengths));
-    end
-    wl = wavelengths(band_mask);
-    X  = double(cube(:,:,band_mask));
-    nB = numel(wl);
-
-    % Dual-band CO2 absorption template (identical definition used by CT-ACE)
-    amp1 = 0.30; cen1 = 1575; sig1 = 15;
-    amp2 = 0.70; cen2 = 2005; sig2 = 12;
-    sig = amp1 * exp(-0.5*((wl-cen1)/sig1).^2) + ...
-          amp2 * exp(-0.5*((wl-cen2)/sig2).^2);
-    sig  = sig / norm(sig);
-    ref0 = sig - mean(sig);                 % mean-centred
-
-    % Vectorised per-pixel correlation
-    X2d = reshape(X, H*W, nB);
-    mu  = mean(X2d, 2);
-    sd  = std(X2d, 0, 2);
-    sd(sd < 1e-8) = 1;                      % avoid division by zero
-    Xn  = (X2d - mu) ./ sd;
-    scores = (Xn * ref0) / nB;
-    scores = max(scores, 0);
-
-    co2_map = reshape(scores, H, W);
-    mx = max(co2_map(:));
-    if mx > 0
-        co2_map = co2_map / mx;
-    end
-
-    thr = prctile(co2_map(:), 95);
-    binary_map = bwareaopen(co2_map > thr, 10);
+    [co2_map, hotspot_mask, fin] = U.finalize(reshape(raw, rows, cols), D, cfg);
+    info = fin;
+    info.bands = numel(idx);
 end
